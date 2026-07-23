@@ -1,0 +1,3368 @@
+📁 Backend (Google Apps Script)
+
+Config.gs
+
+  /**
+  * Config.gs
+  * ---------------------------------------------------------------------------
+  * Central access point for:
+  *   - the active Spreadsheet
+  *   - Script Properties (secrets / environment configuration)
+  *   - CacheService (JSON-aware helpers)
+  *   - LockService (safe, auto-releasing wrapper)
+  *
+  * No other file should call PropertiesService, CacheService or LockService
+  * directly - always go through Config so behaviour (TTLs, error handling,
+  * JSON parsing) stays consistent across the whole project.
+  * ---------------------------------------------------------------------------
+  */
+
+  const Config = (function () {
+
+    let cachedSpreadsheet = null;
+
+    /**
+    * Returns the active Spreadsheet, memoized for the lifetime of the
+    * current execution.
+    * @return {Spreadsheet}
+    */
+    function getSpreadsheet() {
+      if (!cachedSpreadsheet) {
+        cachedSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+        if (!cachedSpreadsheet) {
+          throw new Error('Config.getSpreadsheet: no active spreadsheet is bound to this script.');
+        }
+      }
+      return cachedSpreadsheet;
+    }
+
+    /**
+    * Reads a value from Script Properties.
+    * @param {string} key One of SCRIPT_PROPERTY_KEYS.
+    * @param {boolean=} required If true, throws when the property is missing.
+    * @param {string=} defaultValue Value returned when not required and missing.
+    * @return {string|null}
+    */
+    function getScriptProperty(key, required, defaultValue) {
+      const value = PropertiesService.getScriptProperties().getProperty(key);
+      if (value === null || value === '') {
+        if (required) {
+          throw new Error(
+            'Config.getScriptProperty: required Script Property "' + key + '" is not set. ' +
+            'Set it via Project Settings > Script Properties.'
+          );
+        }
+        return defaultValue !== undefined ? defaultValue : null;
+      }
+      return value;
+    }
+
+    /**
+    * Writes a value to Script Properties.
+    * @param {string} key
+    * @param {string} value
+    */
+    function setScriptProperty(key, value) {
+      PropertiesService.getScriptProperties().setProperty(key, String(value));
+    }
+
+    /**
+    * Writes multiple Script Properties at once.
+    * @param {Object<string,string>} map
+    */
+    function setScriptProperties(map) {
+      PropertiesService.getScriptProperties().setProperties(map, false);
+    }
+
+    /**
+    * Returns the Gemini API key, throwing a clear error if it has not been
+    * configured yet.
+    * @return {string}
+    */
+    function getGeminiApiKey() {
+      return getScriptProperty(SCRIPT_PROPERTY_KEYS.GEMINI_API_KEY, true);
+    }
+
+    /**
+    * Returns the IANA timezone used for all date formatting in the project.
+    * @return {string}
+    */
+    function getTimezone() {
+      return getScriptProperty(SCRIPT_PROPERTY_KEYS.TIMEZONE, false, DEFAULT_TIMEZONE);
+    }
+
+    /**
+    * Returns the Drive folder ID under which all BIP attachment folders are
+    * created, creating and persisting one under "My Drive" the first time
+    * it is requested if it has not been configured yet.
+    * @return {string}
+    */
+    function getRootDriveFolderId() {
+      let folderId = getScriptProperty(SCRIPT_PROPERTY_KEYS.ROOT_DRIVE_FOLDER_ID, false, null);
+      if (folderId) {
+        try {
+          DriveApp.getFolderById(folderId);
+          return folderId;
+        } catch (e) {
+          AppUtils.log(LOG_LEVEL.WARN, 'Config', 'Stored ROOT_DRIVE_FOLDER_ID is invalid, recreating.', e.message);
+        }
+      }
+      const folder = DriveApp.getRootFolder().createFolder('BIP Management System');
+      folderId = folder.getId();
+      setScriptProperty(SCRIPT_PROPERTY_KEYS.ROOT_DRIVE_FOLDER_ID, folderId);
+      return folderId;
+    }
+
+    // ---------------------------------------------------------------------
+    // Cache helpers (JSON-aware wrapper around the Script cache)
+    // ---------------------------------------------------------------------
+
+    /**
+    * Reads and JSON-parses a cached value.
+    * @param {string} key
+    * @return {*} The parsed value, or null if not present / not parseable.
+    */
+    function cacheGet(key) {
+      try {
+        const raw = CacheService.getScriptCache().get(key);
+        if (raw === null) return null;
+        return JSON.parse(raw);
+      } catch (e) {
+        AppUtils.log(LOG_LEVEL.WARN, 'Config', 'cacheGet failed for key "' + key + '".', e.message);
+        return null;
+      }
+    }
+
+    /**
+    * JSON-stringifies and stores a value in the Script cache.
+    * @param {string} key
+    * @param {*} value
+    * @param {number} ttlSeconds Max 21600 (6 hours) per CacheService limits.
+    */
+    function cachePut(key, value, ttlSeconds) {
+      try {
+        const ttl = Math.min(Math.max(ttlSeconds || 600, 1), 21600);
+        CacheService.getScriptCache().put(key, JSON.stringify(value), ttl);
+      } catch (e) {
+        AppUtils.log(LOG_LEVEL.WARN, 'Config', 'cachePut failed for key "' + key + '".', e.message);
+      }
+    }
+
+    /**
+    * Removes a single key from the Script cache.
+    * @param {string} key
+    */
+    function cacheRemove(key) {
+      try {
+        CacheService.getScriptCache().remove(key);
+      } catch (e) {
+        AppUtils.log(LOG_LEVEL.WARN, 'Config', 'cacheRemove failed for key "' + key + '".', e.message);
+      }
+    }
+
+    /**
+    * Removes several keys from the Script cache at once.
+    * @param {Array<string>} keys
+    */
+    function cacheRemoveAll(keys) {
+      try {
+        CacheService.getScriptCache().removeAll(keys);
+      } catch (e) {
+        AppUtils.log(LOG_LEVEL.WARN, 'Config', 'cacheRemoveAll failed.', e.message);
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Lock helpers
+    // ---------------------------------------------------------------------
+
+    /**
+    * Runs `fn` while holding the script lock, guaranteeing the lock is
+    * released even if `fn` throws. Use this around every read-modify-write
+    * sequence against a sheet (append/update/delete) to avoid race
+    * conditions between triggers.
+    * @param {function():*} fn
+    * @param {number=} waitMs
+    * @return {*} Whatever `fn` returns.
+    */
+    function withLock(fn, waitMs) {
+      const lock = LockService.getScriptLock();
+      const acquired = lock.tryLock(waitMs || LOCK_WAIT_MS);
+      if (!acquired) {
+        throw new Error('Config.withLock: could not acquire script lock within ' + (waitMs || LOCK_WAIT_MS) + 'ms.');
+      }
+      try {
+        return fn();
+      } finally {
+        lock.releaseLock();
+      }
+    }
+
+    return {
+      getSpreadsheet: getSpreadsheet,
+      getScriptProperty: getScriptProperty,
+      setScriptProperty: setScriptProperty,
+      setScriptProperties: setScriptProperties,
+      getGeminiApiKey: getGeminiApiKey,
+      getTimezone: getTimezone,
+      getRootDriveFolderId: getRootDriveFolderId,
+      cacheGet: cacheGet,
+      cachePut: cachePut,
+      cacheRemove: cacheRemove,
+      cacheRemoveAll: cacheRemoveAll,
+      withLock: withLock
+    };
+
+  })();
+
+
+Router.gs
+
+  /**
+  * Router.gs
+  * ---------------------------------------------------------------------------
+  * REST-like action dispatcher for the BIP Management System web app.
+  *
+  * Two call paths reach the same dispatch table:
+  *   1. True HTTP requests to the deployed web app URL, handled by
+  *      WebApp.doGet/doPost (e.g. GET .../exec?action=dashboard, or an
+  *      external system POSTing JSON). Useful for integrations outside the
+  *      dashboard UI itself.
+  *   2. google.script.run calls from the dashboard's own client-side
+  *      JavaScript, via the global apiGet()/apiPost() wrapper functions
+  *      exported at the bottom of this file. This is the path the built-in
+  *      dashboard frontend actually uses - it avoids the cross-origin
+  *      fetch() quirks of calling a web app's own /exec URL from inside its
+  *      sandboxed HtmlService iframe, while still going through the exact
+  *      same isolated action handlers as the HTTP path.
+  *
+  * Every action is a small, independently readable handler function; none of
+  * them talk to SpreadsheetApp/DriveApp/GmailApp directly - they all go
+  * through DashboardService, TriggerService or SpreadsheetService, which is
+  * where those boundaries are actually enforced.
+  *
+  * Response envelope (both call paths): every handler either returns a plain
+  * JS value (wrapped as { success: true, data }) or throws an Error, which
+  * the caller (WebApp for HTTP, google.script.run's own failure handler for
+  * RPC) is responsible for turning into an error response.
+  * ---------------------------------------------------------------------------
+  */
+
+  const Router = (function () {
+
+    const DEFAULT_SEARCH_LIMIT = 50;
+
+    // -------------------------------------------------------------------
+    // Param helpers
+    // -------------------------------------------------------------------
+
+    /**
+    * Returns params[name], throwing if it is missing/empty.
+    * @param {Object} params
+    * @param {string} name
+    * @return {*}
+    */
+    function requireParam(params, name) {
+      const value = params ? params[name] : undefined;
+      if (AppUtils.isEmpty(value)) {
+        throw new Error('Router: missing required parameter "' + name + '".');
+      }
+      return value;
+    }
+
+    /**
+    * Coerces a query-string/body value into a number, throwing a clear error
+    * if it cannot be parsed - used for row numbers, limits and offsets which
+    * must never silently become NaN.
+    * @param {*} value
+    * @param {string} name
+    * @return {number}
+    */
+    function toNumber(value, name) {
+      const num = Number(value);
+      if (isNaN(num)) {
+        throw new Error('Router: parameter "' + name + '" must be a number, got "' + value + '".');
+      }
+      return num;
+    }
+
+    // -------------------------------------------------------------------
+    // GET (read-only) action handlers
+    // -------------------------------------------------------------------
+
+    /**
+    * Lightweight liveness/connectivity check: confirms the spreadsheet is
+    * reachable and reports basic environment info. Deliberately does not
+    * touch Gmail/Drive/Gemini so it stays fast and cheap to poll.
+    * @return {Object}
+    */
+    function handleHealth() {
+      const spreadsheet = Config.getSpreadsheet();
+      return {
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        timezone: Config.getTimezone(),
+        spreadsheetUrl: spreadsheet.getUrl(),
+        spreadsheetName: spreadsheet.getName()
+      };
+    }
+
+    /**
+    * Full dashboard overview payload (cached - see DashboardService.getDashboardOverview).
+    * @param {Object} params
+    * @return {Object}
+    */
+    function handleDashboard(params) {
+      const forceRefresh = params && (params.refresh === 'true' || params.refresh === true);
+      return DashboardService.getDashboardOverview(!!forceRefresh);
+    }
+
+    /**
+    * Granular statistics payload: status summary, faculty statistics,
+    * university list and the (currently unavailable) country stats.
+    * @return {Object}
+    */
+    function handleStatistics() {
+      return {
+        statusSummary: DashboardService.getStatusSummary(),
+        facultyStatistics: DashboardService.getFacultyStatistics(),
+        universities: DashboardService.getUniversities(),
+        countryStats: DashboardService.getCountryStats()
+      };
+    }
+
+    /**
+    * Search/filter action. All filters are optional; an empty params object
+    * returns the first page of every BIP plus current filter facets.
+    * @param {Object} params
+    * @return {Object}
+    */
+    function handleSearch(params) {
+      const p = params || {};
+      return DashboardService.searchBips({
+        query: p.query,
+        status: p.status,
+        faculty: p.faculty,
+        university: p.university,
+        deadlineFrom: p.deadlineFrom,
+        deadlineTo: p.deadlineTo,
+        limit: p.limit ? toNumber(p.limit, 'limit') : DEFAULT_SEARCH_LIMIT,
+        offset: p.offset ? toNumber(p.offset, 'offset') : 0
+      });
+    }
+
+    /**
+    * Full detail record for one BIP.
+    * @param {Object} params
+    * @return {Object}
+    */
+    function handleDetails(params) {
+      const rowNumber = toNumber(requireParam(params, 'rowNumber'), 'rowNumber');
+      return DashboardService.getBipDetails(rowNumber);
+    }
+
+    /**
+    * BIPs currently eligible for a reminder (read-only list; sending
+    * reminders is a POST action, see handleSendReminders below).
+    * @return {Array<Object>}
+    */
+    function handleGetReminders() {
+      return DashboardService.getUpcomingReminders();
+    }
+
+    /**
+    * Current Settings sheet contents.
+    * @return {Array<Object>}
+    */
+    function handleGetSettings() {
+      return DashboardService.getSettings();
+    }
+
+    // -------------------------------------------------------------------
+    // POST (mutating) action handlers
+    // -------------------------------------------------------------------
+
+    /**
+    * Updates a BIP's status. Body: { rowNumber, status }.
+    * @param {Object} params
+    * @return {Object}
+    */
+    function handleUpdateStatus(params) {
+      const rowNumber = toNumber(requireParam(params, 'rowNumber'), 'rowNumber');
+      const status = requireParam(params, 'status');
+      return DashboardService.updateBipStatus(rowNumber, status);
+    }
+
+    /**
+    * Manually triggers the same hourly Gmail import pipeline TriggerService
+    * runs automatically. Intended for an "Import now" button. Invalidates
+    * the dashboard cache afterwards so the next dashboard load reflects any
+    * newly-imported BIPs immediately.
+    * @return {{imported: number, failed: number, total: number}}
+    */
+    function handleImport() {
+      const result = TriggerService.runImportGmail();
+      DashboardService.invalidateOverviewCache();
+      return result;
+    }
+
+    /**
+    * Manually triggers the same daily reminder pipeline ReminderService runs
+    * automatically. Intended for a "Send reminders now" button.
+    * @return {{checked: number, sent: number, skipped: number}}
+    */
+    function handleSendReminders() {
+      const result = TriggerService.runSendReminders();
+      DashboardService.invalidateOverviewCache();
+      return result;
+    }
+
+    /**
+    * Upserts a single Settings row. Body: { key, value }.
+    * @param {Object} params
+    * @return {Object}
+    */
+    function handleUpdateSettings(params) {
+      const key = requireParam(params, 'key');
+      const value = params.value !== undefined ? params.value : '';
+      return DashboardService.upsertSetting(key, value);
+    }
+
+    // -------------------------------------------------------------------
+    // Dispatch tables
+    // -------------------------------------------------------------------
+
+    const GET_ACTIONS = Object.freeze({
+      health: handleHealth,
+      dashboard: handleDashboard,
+      statistics: handleStatistics,
+      search: handleSearch,
+      details: handleDetails,
+      reminders: handleGetReminders,
+      settings: handleGetSettings
+    });
+
+    const POST_ACTIONS = Object.freeze({
+      updateStatus: handleUpdateStatus,
+      import: handleImport,
+      reminders: handleSendReminders,
+      settings: handleUpdateSettings
+    });
+
+    /**
+    * Dispatches a GET (read-only) action.
+    * @param {string} action
+    * @param {Object} params
+    * @return {*} Whatever the handler returns - not yet wrapped in an envelope.
+    */
+    function handleGet(action, params) {
+      if (AppUtils.isEmpty(action)) {
+        throw new Error('Router.handleGet: "action" is required.');
+      }
+      const handler = GET_ACTIONS[action];
+      if (!handler) {
+        throw new Error('Router.handleGet: unknown action "' + action + '". Known GET actions: ' + Object.keys(GET_ACTIONS).join(', '));
+      }
+      return handler(params || {});
+    }
+
+    /**
+    * Dispatches a POST (mutating) action.
+    * @param {string} action
+    * @param {Object} params
+    * @return {*} Whatever the handler returns - not yet wrapped in an envelope.
+    */
+    function handlePost(action, params) {
+      if (AppUtils.isEmpty(action)) {
+        throw new Error('Router.handlePost: "action" is required.');
+      }
+      const handler = POST_ACTIONS[action];
+      if (!handler) {
+        throw new Error('Router.handlePost: unknown action "' + action + '". Known POST actions: ' + Object.keys(POST_ACTIONS).join(', '));
+      }
+      return handler(params || {});
+    }
+
+    return {
+      handleGet: handleGet,
+      handlePost: handlePost
+    };
+
+  })();
+
+  /**
+  * Global RPC entry point for google.script.run read (GET-equivalent)
+  * actions from the dashboard's client-side JavaScript. Kept as a bare
+  * top-level function (mirroring the TRIGGER_HANDLERS pattern in
+  * TriggerService.gs) because google.script.run can only invoke top-level
+  * global functions, never namespaced object methods. Any error thrown by
+  * Router.handleGet propagates to the client's withFailureHandler as-is.
+  * @param {string} action
+  * @param {Object=} params
+  * @return {*}
+  */
+  function apiGet(action, params) {
+    return Router.handleGet(action, params);
+  }
+
+  /**
+  * Global RPC entry point for google.script.run write (POST-equivalent)
+  * actions from the dashboard's client-side JavaScript. See apiGet() above
+  * for why this is a bare top-level function.
+  * @param {string} action
+  * @param {Object=} params
+  * @return {*}
+  */
+  function apiPost(action, params) {
+    return Router.handlePost(action, params);
+  }
+
+WebApp.gs
+
+  /**
+  * WebApp.gs
+  * ---------------------------------------------------------------------------
+  * The Apps Script web app entry points. Deliberately minimal: all routing
+  * logic lives in Router.gs, all data/aggregation logic lives in
+  * DashboardService.gs (and the services it composes). This file only knows
+  * how to (a) tell a page load apart from an API call, (b) translate
+  * Router's return value / thrown errors into a JSON HTTP response, and
+  * (c) stitch the HTML partials together.
+  *
+  * GET  {webapp url}                  -> serves the dashboard (index.html)
+  * GET  {webapp url}?action=dashboard -> JSON API (see Router.gs GET_ACTIONS)
+  * POST {webapp url}                  -> JSON API (see Router.gs POST_ACTIONS),
+  *                                        body: { "action": "...", "params": {...} }
+  *
+  * The dashboard's own client-side JavaScript does NOT use these HTTP
+  * endpoints (see the note in Router.gs) - it calls apiGet()/apiPost() via
+  * google.script.run instead. The action-based JSON responses here exist so
+  * Router.gs is genuinely usable as a REST-like API by external tools.
+  * ---------------------------------------------------------------------------
+  */
+
+  /**
+  * Handles GET requests: serves the dashboard HTML, or - when an "action"
+  * query parameter is present - dispatches to Router.handleGet and returns
+  * the result as JSON.
+  * @param {Object} e Apps Script event object.
+  * @return {HtmlOutput|TextOutput}
+  */
+  function doGet(e) {
+    const params = (e && e.parameter) || {};
+
+    if (params.action) {
+      let payload;
+      try {
+        payload = { success: true, data: Router.handleGet(params.action, params) };
+      } catch (err) {
+        payload = { success: false, error: err.message };
+      }
+      return ContentService.createTextOutput(JSON.stringify(payload)).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    const template = HtmlService.createTemplateFromFile('index');
+    template.scriptUrl = ScriptApp.getService().getUrl();
+    return template.evaluate()
+      .setTitle('BIP Management System - STU')
+      .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  }
+
+  /**
+  * Handles POST requests: dispatches to Router.handlePost and returns the
+  * result as JSON. Accepts a JSON body of the form { "action": "...",
+  * "params": {...} }, falling back to URL/form parameters if no JSON body
+  * is present.
+  * @param {Object} e Apps Script event object.
+  * @return {TextOutput}
+  */
+  function doPost(e) {
+    let payload;
+    try {
+      let action = null;
+      let params = {};
+
+      if (e && e.postData && e.postData.contents) {
+        const body = JSON.parse(e.postData.contents);
+        action = body.action;
+        params = body.params || body;
+      } else if (e && e.parameter) {
+        action = e.parameter.action;
+        params = e.parameter;
+      }
+
+      payload = { success: true, data: Router.handlePost(action, params) };
+    } catch (err) {
+      payload = { success: false, error: err.message };
+    }
+    return ContentService.createTextOutput(JSON.stringify(payload)).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  /**
+  * Inlines another HTML-service file's content, used by index.html to pull
+  * in Stylesheet.html and JavaScript.html. Apps Script templating helper -
+  * see https://developers.google.com/apps-script/guides/html/best-practices#separate_html_css_and_javascript
+  * @param {string} filename
+  * @return {string}
+  */
+  function include(filename) {
+    return HtmlService.createHtmlOutputFromFile(filename).getContent();
+  }
+
+GmailService.gs
+
+  /**
+  * GmailService.gs
+  * ---------------------------------------------------------------------------
+  * Responsible for everything Gmail-related: reading messages under the
+  * GMAIL_LABEL_NEW_BIPS label, extracting structured data from them,
+  * detecting duplicates against the Metadata sheet, and moving processed
+  * messages into the GMAIL_LABEL_PROCESSED label.
+  *
+  * This file never touches SpreadsheetApp directly - duplicate detection
+  * goes through SpreadsheetService.
+  * ---------------------------------------------------------------------------
+  */
+
+  const GmailService = (function () {
+
+    /**
+    * Returns the GmailApp label object for GMAIL_LABEL_PROCESSED, creating
+    * it automatically the first time it is needed.
+    * @return {GmailLabel}
+    */
+    function ensureProcessedLabelExists() {
+      let label = GmailApp.getUserLabelByName(GMAIL_LABEL_PROCESSED);
+      if (!label) {
+        label = GmailApp.createLabel(GMAIL_LABEL_PROCESSED);
+        AppUtils.log(LOG_LEVEL.INFO, 'GmailService', 'Created missing Gmail label.', GMAIL_LABEL_PROCESSED);
+      }
+      return label;
+    }
+
+    /**
+    * Returns the GmailApp label object for GMAIL_LABEL_NEW_BIPS, throwing a
+    * descriptive error if it has not been created yet (this label is
+    * expected to already exist - the International Relations Office's
+    * Gmail filter creates it).
+    * @return {GmailLabel}
+    */
+    function getNewBipsLabel() {
+      const label = GmailApp.getUserLabelByName(GMAIL_LABEL_NEW_BIPS);
+      if (!label) {
+        throw new Error('GmailService.getNewBipsLabel: Gmail label "' + GMAIL_LABEL_NEW_BIPS + '" does not exist. Create it and attach the appropriate Gmail filter first.');
+      }
+      return label;
+    }
+
+    /**
+    * Builds a stable Gmail permalink for a message.
+    * @param {GmailMessage} message
+    * @return {string}
+    */
+    function buildGmailUrl(message) {
+      return 'https://mail.google.com/mail/u/0/#all/' + message.getId();
+    }
+
+    /**
+    * Extracts attachment metadata + blobs from a message.
+    * @param {GmailMessage} message
+    * @return {Array<{name: string, contentType: string, size: number, blob: Blob}>}
+    */
+    function extractAttachments(message) {
+      return message.getAttachments({
+        includeInlineImages: false,
+        includeAttachments: true
+      }).map(function (blob) {
+        return {
+          name: blob.getName(),
+          contentType: blob.getContentType(),
+          size: blob.getBytes().length,
+          blob: blob
+        };
+      });
+    }
+
+    /**
+    * Converts a single GmailMessage into a plain "EmailData" object used by
+    * the rest of the application (GeminiService, DriveService,
+    * NotificationService, TriggerService).
+    *
+    * The underlying GmailMessage and GmailThread are kept on the returned
+    * object (message / thread properties) so GmailService.markMessageProcessed
+    * can be called later in the same execution - they are not meant to be
+    * persisted or serialized.
+    *
+    * @param {GmailMessage} message
+    * @return {Object} EmailData
+    */
+    function extractEmailData(message) {
+      return {
+        messageId: message.getId(),
+        threadId: message.getThread().getId(),
+        subject: message.getSubject(),
+        plainBody: message.getPlainBody(),
+        htmlBody: message.getBody(),
+        attachments: extractAttachments(message),
+        from: message.getFrom(),
+        to: message.getTo(),
+        receivedDate: message.getDate(),
+        gmailUrl: buildGmailUrl(message),
+        message: message
+      };
+    }
+
+    /**
+    * Fetches every message under GMAIL_LABEL_NEW_BIPS that has not already
+    * been imported (checked against the Metadata sheet by Message ID),
+    * newest first.
+    *
+    * Wrapped in the script lock so two overlapping executions (e.g. a
+    * manual run colliding with the hourly trigger) never build the same
+    * "new emails" batch twice.
+    *
+    * @return {Array<Object>} Array of EmailData, newest received first.
+    */
+    function fetchNewBipMessages() {
+      return Config.withLock(function () {
+        const label = getNewBipsLabel();
+        const threads = label.getThreads();
+
+        // getThreads() returns threads ordered by most recent activity
+        // descending, which already satisfies "newest first" at the thread
+        // level; we still sort the flattened message list explicitly below
+        // to guarantee ordering even for multi-message threads.
+        const allMessages = [];
+        threads.forEach(function (thread) {
+          thread.getMessages().forEach(function (message) {
+            allMessages.push(message);
+          });
+        });
+
+        allMessages.sort(function (a, b) {
+          return b.getDate().getTime() - a.getDate().getTime();
+        });
+
+        const result = [];
+        allMessages.forEach(function (message) {
+          const messageId = message.getId();
+          if (SpreadsheetService.exists(SHEET_NAMES.METADATA, METADATA_HEADERS.MESSAGE_ID, messageId)) {
+            return; // already imported, skip
+          }
+          result.push(extractEmailData(message));
+        });
+
+        return result;
+      });
+    }
+
+    /**
+    * Marks a message as processed: applies GMAIL_LABEL_PROCESSED to its
+    * thread and removes GMAIL_LABEL_NEW_BIPS, so it will not be picked up
+    * again by fetchNewBipMessages(). Call this ONLY after the message has
+    * been fully imported (row written, attachments uploaded, metadata
+    * saved, notification sent) so a mid-import failure leaves the message
+    * under the new-bips label for the next hourly run to retry.
+    * @param {GmailMessage} message
+    */
+    function markMessageProcessed(message) {
+      const processedLabel = ensureProcessedLabelExists();
+      const newBipsLabel = getNewBipsLabel();
+      const thread = message.getThread();
+      thread.addLabel(processedLabel);
+      thread.removeLabel(newBipsLabel);
+    }
+
+    return {
+      fetchNewBipMessages: fetchNewBipMessages,
+      markMessageProcessed: markMessageProcessed,
+      buildGmailUrl: buildGmailUrl,
+      ensureProcessedLabelExists: ensureProcessedLabelExists
+    };
+
+  })();
+
+
+GeminiService.gs
+
+  /**
+  * GeminiService.gs
+  * ---------------------------------------------------------------------------
+  * The ONLY file in this project allowed to call the Gemini API. Extracts
+  * structured BIP data from a raw e-mail (subject + body) using Gemini
+  * 2.5 Pro, retries on transient failures, and validates the response
+  * before ever handing it back to a caller.
+  *
+  * GeminiService NEVER returns raw text and NEVER duplicates JSON parsing
+  * or field validation logic - both are delegated to Parser.gs
+  * (Parser.parseGeminiJson / Parser.validateParsedFields) so there is a
+  * single implementation of "what does a valid Gemini response look like"
+  * shared by both files.
+  *
+  * The object returned by GeminiService.extractBipData() has exactly the
+  * shape Parser.parseGeminiResponse() expects as input:
+  *   { bipName, university, level, startDate, endDate, deadline,
+  *     applicationMethod, requirements, faculties, studentCount,
+  *     details, notes }
+  * ---------------------------------------------------------------------------
+  */
+
+  const GeminiService = (function () {
+
+    /**
+    * Builds the extraction prompt sent to Gemini for a single e-mail. The
+    * schema requested here is intentionally identical to the object shape
+    * documented at the top of Parser.gs.
+    * @param {Object} emailData EmailData as produced by GmailService.
+    * @return {string}
+    */
+    function buildExtractionPrompt(emailData) {
+      const bodyText = AppUtils.isEmpty(emailData.plainBody) ? emailData.htmlBody : emailData.plainBody;
+
+      return [
+        'You are an information-extraction assistant for the International Relations Office of the ' +
+        'Slovak University of Technology (STU). You will be given the subject and body of an e-mail ' +
+        'announcing a Blended Intensive Programme (BIP) invitation from a partner university.',
+        '',
+        'Extract the information into a single JSON object with EXACTLY these keys and nothing else:',
+        '{',
+        '  "bipName": string,            // short name/title of the BIP programme',
+        '  "university": string,         // name of the inviting partner university',
+        '  "level": string,              // study level, e.g. "Bakalár", "Magister", "PhD", or "" if unknown',
+        '  "startDate": string,          // programme start date, any recognizable date format, or "" if unknown',
+        '  "endDate": string,            // programme end date, or "" if unknown',
+        '  "deadline": string,           // application deadline date, or "" if unknown',
+        '  "applicationMethod": string,  // how students should apply (portal, e-mail, form, ...)',
+        '  "requirements": string,       // eligibility / application requirements',
+        '  "faculties": string[],        // STU faculties this BIP appears relevant to; use short codes when possible: SvF, SjF, FEI, FCHPT, FAD, MTF, FIIT. Empty array if unclear.',
+        '  "studentCount": string,       // number of students STU may send, or "" if unknown',
+        '  "details": string,            // 2-4 sentence free-text summary of the programme',
+        '  "notes": string               // anything else worth recording; "" if nothing',
+        '}',
+        '',
+        'Rules:',
+        '- Output ONLY the raw JSON object. No Markdown code fences, no commentary, no explanations.',
+        '- Use "" for any text field you cannot determine. Use [] for faculties if none apply.',
+        '- Dates should be written as they best can be determined, preferably as DD.MM.YYYY.',
+        '- Do not invent information that is not present in the e-mail.',
+        '',
+        'E-mail subject: ' + emailData.subject,
+        'E-mail body:',
+        bodyText
+      ].join('\n');
+    }
+
+    /**
+    * Performs a single (non-retried) call to the Gemini generateContent
+    * endpoint and returns the raw text of the model's reply.
+    * @param {string} prompt
+    * @return {string}
+    */
+    function callGeminiApi(prompt) {
+      const apiKey = Config.getGeminiApiKey();
+      const url = GEMINI_CONFIG.API_BASE_URL + GEMINI_CONFIG.MODEL + ':generateContent?key=' + encodeURIComponent(apiKey);
+
+      const payload = {
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: prompt }]
+          }
+        ],
+        generationConfig: {
+          temperature: 0.1,
+          responseMimeType: 'application/json'
+        }
+      };
+
+      const response = UrlFetchApp.fetch(url, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      });
+
+      const statusCode = response.getResponseCode();
+      const responseText = response.getContentText();
+
+      if (statusCode < 200 || statusCode >= 300) {
+        throw new Error('GeminiService.callGeminiApi: HTTP ' + statusCode + ' from Gemini API: ' + responseText);
+      }
+
+      let parsedResponse;
+      try {
+        parsedResponse = JSON.parse(responseText);
+      } catch (e) {
+        throw new Error('GeminiService.callGeminiApi: Gemini API returned a non-JSON HTTP envelope: ' + e.message);
+      }
+
+      const candidate = parsedResponse.candidates && parsedResponse.candidates[0];
+      const part = candidate && candidate.content && candidate.content.parts && candidate.content.parts[0];
+      const text = part && part.text;
+
+      if (AppUtils.isEmpty(text)) {
+        throw new Error('GeminiService.callGeminiApi: Gemini API response contained no text content. Raw: ' + responseText);
+      }
+
+      return text;
+    }
+
+    /**
+    * Calls Gemini for one e-mail, parses and validates the response, and
+    * retries on any failure (HTTP error, invalid JSON, missing required
+    * fields) up to GEMINI_CONFIG.MAX_RETRIES times.
+    * @param {Object} emailData EmailData as produced by GmailService.
+    * @return {Object} A validated object matching Parser.gs's expected input shape.
+    */
+    function extractBipData(emailData) {
+      const prompt = buildExtractionPrompt(emailData);
+
+      const result = AppUtils.retry(function () {
+        const rawText = callGeminiApi(prompt);
+
+        // Reuse Parser's JSON extraction/parsing so there is exactly one
+        // implementation of "how do we turn Gemini's text into an object".
+        const parsed = Parser.parseGeminiJson(rawText);
+
+        if (Array.isArray(parsed) || typeof parsed !== 'object' || parsed === null) {
+          throw new Error('GeminiService.extractBipData: Gemini response was valid JSON but not a single object.');
+        }
+
+        // Reuse Parser's own field validation instead of re-implementing it.
+        const validation = Parser.validateParsedFields(parsed);
+        if (!validation.valid) {
+          throw new Error('GeminiService.extractBipData: Gemini response is missing required fields: ' + validation.missing.join(', '));
+        }
+
+        return parsed;
+      }, GEMINI_CONFIG.MAX_RETRIES, GEMINI_CONFIG.RETRY_DELAY_MS);
+
+      AppUtils.log(LOG_LEVEL.INFO, 'GeminiService', 'Extracted BIP data from e-mail.', { subject: emailData.subject, university: result.university });
+
+      return result;
+    }
+
+    return {
+      extractBipData: extractBipData
+    };
+
+  })();
+
+
+Parser.gs
+
+  /**
+  * Parser.gs
+  * ---------------------------------------------------------------------------
+  * Converts the JSON returned by GeminiService into clean, normalized row
+  * objects ready to be written to the Main sheet via SpreadsheetService.
+  *
+  * Expected shape of the JSON produced by GeminiService for a BIP
+  * invitation e-mail (GeminiService.gs is responsible for prompting Gemini
+  * to return exactly this shape):
+  *
+  * {
+  *   "bipName": "string",
+  *   "university": "string",
+  *   "level": "string",              // e.g. "Bakalár", "Magister", "PhD"
+  *   "startDate": "string",          // any of the formats AppUtils.parseDate understands
+  *   "endDate": "string",
+  *   "deadline": "string",
+  *   "applicationMethod": "string",
+  *   "requirements": "string",
+  *   "faculties": ["string", ...],   // faculty codes and/or full names
+  *   "studentCount": "string|number",
+  *   "details": "string",
+  *   "notes": "string"
+  * }
+  *
+  * Every field is optional as far as the parser is concerned - GeminiService
+  * validates the response against its own schema before Parser ever sees
+  * it, but Parser is defensive on top of that so a malformed or partial
+  * response never throws halfway through building a row.
+  * ---------------------------------------------------------------------------
+  */
+
+  const Parser = (function () {
+
+    /**
+    * Parses a raw JSON string returned by the Gemini API into a plain
+    * object. Strips common Markdown code-fence wrapping ( ```json ... ``` )
+    * that Gemini sometimes adds despite being asked for raw JSON.
+    * @param {string} rawText
+    * @return {Object}
+    */
+    function parseGeminiJson(rawText) {
+      if (AppUtils.isEmpty(rawText)) {
+        throw new Error('Parser.parseGeminiJson: empty response text.');
+      }
+      const cleaned = String(rawText)
+        .trim()
+        .replace(/^```json/i, '')
+        .replace(/^```/, '')
+        .replace(/```$/, '')
+        .trim();
+
+      try {
+        return JSON.parse(cleaned);
+      } catch (e) {
+        throw new Error('Parser.parseGeminiJson: could not parse Gemini response as JSON. ' + e.message);
+      }
+    }
+
+    /**
+    * Trims, collapses whitespace and normalizes a free-text field.
+    * @param {*} value
+    * @return {string}
+    */
+    function normalizeText(value) {
+      if (AppUtils.isEmpty(value)) return '';
+      return AppUtils.collapseWhitespace(String(value));
+    }
+
+    /**
+    * Normalizes a university name: trims, collapses whitespace and applies
+    * title case while preserving existing acronyms (e.g. "TU Wien",
+    * "KU Leuven").
+    * @param {*} value
+    * @return {string}
+    */
+    function normalizeUniversityName(value) {
+      const cleaned = normalizeText(value);
+      if (cleaned === '') return '';
+      return AppUtils.toTitleCase(cleaned);
+    }
+
+    /**
+    * Normalizes a date-like value into a Date object using AppUtils, then
+    * back into the project's standard display format. Returns '' if the
+    * value cannot be parsed, rather than throwing, so one bad date never
+    * blocks import of an otherwise valid BIP.
+    * @param {*} value
+    * @return {Date|string} A Date object if parseable, otherwise ''.
+    */
+    function normalizeDate(value) {
+      if (AppUtils.isEmpty(value)) return '';
+      const parsed = AppUtils.parseDate(value);
+      return parsed || '';
+    }
+
+    /**
+    * Normalizes a student-count value to a positive integer, or '' if it
+    * cannot be determined.
+    * @param {*} value
+    * @return {number|string}
+    */
+    function normalizeStudentCount(value) {
+      if (AppUtils.isEmpty(value)) return '';
+      const match = String(value).match(/\d+/);
+      if (!match) return '';
+      const num = parseInt(match[0], 10);
+      return isNaN(num) ? '' : num;
+    }
+
+    /**
+    * Matches a single faculty string (code or full Slovak name, case- and
+    * diacritic-insensitive) against FACULTY_COLUMNS.
+    * @param {string} facultyText
+    * @return {string|null} The matching faculty code (e.g. "FEI"), or null.
+    */
+    function matchFacultyCode(facultyText) {
+      if (AppUtils.isEmpty(facultyText)) return null;
+      const normalized = String(facultyText).trim().toLowerCase();
+
+      // Direct code match (SvF, FEI, ...).
+      const codeMatch = FACULTY_COLUMNS.find(function (code) {
+        return code.toLowerCase() === normalized;
+      });
+      if (codeMatch) return codeMatch;
+
+      // Full-name match (Slovak faculty names).
+      const nameMatch = FACULTY_COLUMNS.find(function (code) {
+        return FACULTY_FULL_NAMES[code].toLowerCase() === normalized;
+      });
+      if (nameMatch) return nameMatch;
+
+      // Loose "contains" match as a last resort (e.g. Gemini returns
+      // "Fakulta elektrotechniky a informatiky STU" with extra suffix).
+      const looseMatch = FACULTY_COLUMNS.find(function (code) {
+        return normalized.indexOf(FACULTY_FULL_NAMES[code].toLowerCase()) !== -1 ||
+              FACULTY_FULL_NAMES[code].toLowerCase().indexOf(normalized) !== -1;
+      });
+      return looseMatch || null;
+    }
+
+    /**
+    * Converts an array of faculty strings (codes and/or full names) into a
+    * map of { [facultyColumnHeader]: 'X' } suitable for merging into a Main
+    * row object. Faculties that cannot be matched are logged and skipped
+    * rather than throwing, so a partially-recognized list still imports.
+    * @param {Array<string>} faculties
+    * @return {Object<string,string>}
+    */
+    function mapFacultiesToColumns(faculties) {
+      const marks = {};
+      if (!Array.isArray(faculties)) return marks;
+
+      faculties.forEach(function (entry) {
+        const code = matchFacultyCode(entry);
+        if (code) {
+          marks[code] = FACULTY_INVITED_MARK;
+        } else {
+          AppUtils.log(LOG_LEVEL.WARN, 'Parser.mapFacultiesToColumns', 'Could not match faculty text to a known faculty.', entry);
+        }
+      });
+      return marks;
+    }
+
+    /**
+    * Validates that the minimum set of fields needed to create a usable
+    * Main row is present after normalization.
+    * @param {Object} normalized
+    * @return {{valid: boolean, missing: Array<string>}}
+    */
+    function validateParsedFields(normalized) {
+      const requiredKeys = ['bipName', 'university'];
+      const missing = requiredKeys.filter(function (key) { return AppUtils.isEmpty(normalized[key]); });
+      return { valid: missing.length === 0, missing: missing };
+    }
+
+    /**
+    * Top-level entry point: takes the raw Gemini JSON string (or an
+    * already-parsed object) plus optional e-mail context, and returns a
+    * fully normalized Main-sheet row object ready for
+    * SpreadsheetService.appendRow(SHEET_NAMES.MAIN, row).
+    *
+    * The row is returned WITHOUT the Stav (status), Súbor (file) and
+    * Podrobnosti-source columns populated by other services:
+    *   - Stav defaults to BIP_STATUS.NEW here (safe default; NotificationService
+    *     may transition it later).
+    *   - Súbor is populated by DriveService after attachments are uploaded.
+    *   - Podrobnosti carries through the free-text "details" field from Gemini.
+    *
+    * @param {string|Object} geminiResponse Raw JSON string or parsed object.
+    * @return {{row: Object, faculties: Array<string>, valid: boolean, missing: Array<string>}}
+    */
+    function parseGeminiResponse(geminiResponse) {
+      const raw = typeof geminiResponse === 'string' ? parseGeminiJson(geminiResponse) : (geminiResponse || {});
+
+      const normalized = {
+        bipName: normalizeText(raw.bipName),
+        university: normalizeUniversityName(raw.university),
+        level: normalizeText(raw.level),
+        startDate: normalizeDate(raw.startDate),
+        endDate: normalizeDate(raw.endDate),
+        deadline: normalizeDate(raw.deadline),
+        applicationMethod: normalizeText(raw.applicationMethod),
+        requirements: normalizeText(raw.requirements),
+        studentCount: normalizeStudentCount(raw.studentCount),
+        details: normalizeText(raw.details),
+        notes: normalizeText(raw.notes)
+      };
+
+      const facultyCodes = Array.isArray(raw.faculties)
+        ? raw.faculties.map(matchFacultyCode).filter(function (c) { return c !== null; })
+        : [];
+      const facultyMarks = mapFacultiesToColumns(raw.faculties || []);
+
+      const validation = validateParsedFields(normalized);
+
+      const row = Object.assign({
+        [MAIN_HEADERS.BIP]: normalized.bipName,
+        [MAIN_HEADERS.UNIVERSITY]: normalized.university,
+        [MAIN_HEADERS.LEVEL]: normalized.level,
+        [MAIN_HEADERS.START_DATE]: normalized.startDate,
+        [MAIN_HEADERS.END_DATE]: normalized.endDate,
+        [MAIN_HEADERS.DEADLINE]: normalized.deadline,
+        [MAIN_HEADERS.APPLICATION_METHOD]: normalized.applicationMethod,
+        [MAIN_HEADERS.REQUIREMENTS]: normalized.requirements,
+        [MAIN_HEADERS.FACULTY]: facultyCodes.join(', '),
+        [MAIN_HEADERS.STUDENT_COUNT]: normalized.studentCount,
+        [MAIN_HEADERS.STATUS]: BIP_STATUS.NEW,
+        [MAIN_HEADERS.DETAILS]: normalized.details,
+        [MAIN_HEADERS.NOTES]: normalized.notes
+      }, facultyMarks);
+
+      return {
+        row: row,
+        faculties: facultyCodes,
+        valid: validation.valid,
+        missing: validation.missing
+      };
+    }
+
+    return {
+      parseGeminiJson: parseGeminiJson,
+      normalizeText: normalizeText,
+      normalizeUniversityName: normalizeUniversityName,
+      normalizeDate: normalizeDate,
+      normalizeStudentCount: normalizeStudentCount,
+      matchFacultyCode: matchFacultyCode,
+      mapFacultiesToColumns: mapFacultiesToColumns,
+      validateParsedFields: validateParsedFields,
+      parseGeminiResponse: parseGeminiResponse
+    };
+
+  })();
+
+
+SpreadsheetService.gs
+
+  /**
+  * SpreadsheetService.gs
+  * ---------------------------------------------------------------------------
+  * The ONLY file in this project allowed to call SpreadsheetApp directly.
+  * Every other service (GmailService, Parser, NotificationService,
+  * ReminderService, DashboardService, Router, ...) must go through the
+  * functions exposed here.
+  *
+  * Row objects returned by this service are plain JS objects keyed by the
+  * exact header text of the sheet (e.g. row[MAIN_HEADERS.BIP]), plus a
+  * "__row" property holding the 1-based sheet row number so callers can
+  * update/delete the row later without re-searching for it.
+  * ---------------------------------------------------------------------------
+  */
+
+  const SpreadsheetService = (function () {
+
+    // -------------------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------------------
+
+    /**
+    * Returns the header row number to use for a given sheet.
+    * @param {string} sheetName
+    * @return {number}
+    */
+    function getHeaderRowNumber(sheetName) {
+      return sheetName === SHEET_NAMES.MAIN ? MAIN_HEADER_ROW : DEFAULT_HEADER_ROW;
+    }
+
+    /**
+    * Returns the Sheet object for a sheet name, throwing a descriptive error
+    * if it does not exist.
+    * @param {string} sheetName One of SHEET_NAMES.
+    * @return {Sheet}
+    */
+    function getSheet(sheetName) {
+      const sheet = Config.getSpreadsheet().getSheetByName(sheetName);
+      if (!sheet) {
+        throw new Error('SpreadsheetService.getSheet: sheet "' + sheetName + '" does not exist. Run Installer.installBIPSystem() first.');
+      }
+      return sheet;
+    }
+
+    /**
+    * Reads the raw header row values (row 1 or row 2 depending on sheet).
+    * @param {string} sheetName
+    * @return {Array<string>}
+    */
+    function getHeaders(sheetName) {
+      const sheet = getSheet(sheetName);
+      const headerRow = getHeaderRowNumber(sheetName);
+      const lastColumn = sheet.getLastColumn();
+      if (lastColumn === 0) return [];
+      return sheet.getRange(headerRow, 1, 1, lastColumn).getValues()[0]
+        .map(function (h) { return String(h).trim(); });
+    }
+
+    /**
+    * Builds a map of headerText -> 1-based column index for a sheet by
+    * reading its header row. Empty header cells are skipped.
+    * @param {string} sheetName
+    * @return {Object<string,number>}
+    */
+    function buildColumnMap(sheetName) {
+      const headers = getHeaders(sheetName);
+      const map = {};
+      headers.forEach(function (header, idx) {
+        if (header !== '') {
+          map[header] = idx + 1; // 1-based column index
+        }
+      });
+      return map;
+    }
+
+    /**
+    * Returns the column map for a sheet, using the Script cache to avoid
+    * re-reading the header row on every call. Cache is invalidated by
+    * cacheColumnMap(sheetName) whenever headers are expected to change
+    * (e.g. after Installer runs).
+    * @param {string} sheetName
+    * @return {Object<string,number>}
+    */
+    function getColumnMap(sheetName) {
+      const cacheKey = CACHE_KEYS.COLUMN_MAP_PREFIX + sheetName;
+      const cached = Config.cacheGet(cacheKey);
+      if (cached) return cached;
+      const map = buildColumnMap(sheetName);
+      Config.cachePut(cacheKey, map, CACHE_TTL_SECONDS.COLUMN_MAP);
+      return map;
+    }
+
+    /**
+    * Forces the column map for a sheet to be rebuilt on next access.
+    * @param {string} sheetName
+    */
+    function cacheColumnMap(sheetName) {
+      Config.cacheRemove(CACHE_KEYS.COLUMN_MAP_PREFIX + sheetName);
+      buildColumnMap(sheetName); // rebuild eagerly so callers see fresh data immediately
+      getColumnMap(sheetName);
+    }
+
+    /**
+    * Returns the 1-based column index for a given header on a sheet.
+    * @param {string} sheetName
+    * @param {string} headerName
+    * @return {number}
+    */
+    function getColumn(sheetName, headerName) {
+      const map = getColumnMap(sheetName);
+      const col = map[headerName];
+      if (!col) {
+        throw new Error('SpreadsheetService.getColumn: header "' + headerName + '" not found on sheet "' + sheetName + '".');
+      }
+      return col;
+    }
+
+    /**
+    * Converts a raw sheet row (array of cell values) into a keyed object
+    * using the column map, and attaches the 1-based row number.
+    * @param {Array} rowValues
+    * @param {Object<string,number>} columnMap
+    * @param {number} rowNumber
+    * @return {Object}
+    */
+    function rowArrayToObject(rowValues, columnMap, rowNumber) {
+      const obj = { __row: rowNumber };
+      Object.keys(columnMap).forEach(function (header) {
+        obj[header] = rowValues[columnMap[header] - 1];
+      });
+      return obj;
+    }
+
+    /**
+    * Converts a keyed row object into a raw array sized to `width`, placing
+    * each value at the column position defined by columnMap. Columns not
+    * present in the input object are left as empty string.
+    * @param {Object} rowObject
+    * @param {Object<string,number>} columnMap
+    * @param {number} width
+    * @return {Array}
+    */
+    function rowObjectToArray(rowObject, columnMap, width) {
+      const arr = new Array(width).fill('');
+      Object.keys(rowObject).forEach(function (key) {
+        if (key === '__row') return;
+        const col = columnMap[key];
+        if (col) {
+          arr[col - 1] = rowObject[key];
+        }
+      });
+      return arr;
+    }
+
+    // -------------------------------------------------------------------
+    // Public CRUD API
+    // -------------------------------------------------------------------
+
+    /**
+    * Returns every data row of a sheet as an array of keyed row objects.
+    * Fully empty rows (all cells blank) are skipped.
+    * @param {string} sheetName
+    * @return {Array<Object>}
+    */
+    function getRows(sheetName) {
+      const sheet = getSheet(sheetName);
+      const headerRow = getHeaderRowNumber(sheetName);
+      const firstDataRow = headerRow + 1;
+      const lastRow = sheet.getLastRow();
+      if (lastRow < firstDataRow) return [];
+
+      const columnMap = getColumnMap(sheetName);
+      const numCols = sheet.getLastColumn();
+      const values = sheet.getRange(firstDataRow, 1, lastRow - firstDataRow + 1, numCols).getValues();
+
+      const rows = [];
+      values.forEach(function (rowValues, idx) {
+        const isRowEmpty = rowValues.every(function (cell) { return AppUtils.isEmpty(cell); });
+        if (isRowEmpty) return;
+        rows.push(rowArrayToObject(rowValues, columnMap, firstDataRow + idx));
+      });
+      return rows;
+    }
+
+    /**
+    * Appends a new row to a sheet. Wrapped in the script lock to avoid two
+    * simultaneous triggers writing to the same row.
+    * @param {string} sheetName
+    * @param {Object} rowObject Keyed by header text, e.g. {[MAIN_HEADERS.BIP]: 'Erasmus+ BIP'}.
+    * @return {number} The 1-based row number the data was written to.
+    */
+    function appendRow(sheetName, rowObject) {
+      return Config.withLock(function () {
+        const sheet = getSheet(sheetName);
+        const columnMap = getColumnMap(sheetName);
+        const width = Math.max(sheet.getLastColumn(), Object.keys(columnMap).length);
+        const arr = rowObjectToArray(rowObject, columnMap, width);
+        sheet.appendRow(arr);
+        return sheet.getLastRow();
+      });
+    }
+
+    /**
+    * Updates specific columns of an existing row, leaving all other
+    * columns untouched. Only the cells present as keys on `updates` are
+    * written.
+    * @param {string} sheetName
+    * @param {number} rowNumber 1-based row number.
+    * @param {Object} updates Keyed by header text.
+    */
+    function updateRow(sheetName, rowNumber, updates) {
+      Config.withLock(function () {
+        const sheet = getSheet(sheetName);
+        const columnMap = getColumnMap(sheetName);
+        Object.keys(updates).forEach(function (key) {
+          if (key === '__row') return;
+          const col = columnMap[key];
+          if (!col) {
+            throw new Error('SpreadsheetService.updateRow: header "' + key + '" not found on sheet "' + sheetName + '".');
+          }
+          sheet.getRange(rowNumber, col).setValue(updates[key]);
+        });
+      });
+    }
+
+    /**
+    * Deletes a row from a sheet.
+    * @param {string} sheetName
+    * @param {number} rowNumber 1-based row number.
+    */
+    function deleteRow(sheetName, rowNumber) {
+      Config.withLock(function () {
+        getSheet(sheetName).deleteRow(rowNumber);
+      });
+    }
+
+    /**
+    * Finds the first row where `headerName` equals `value`.
+    * @param {string} sheetName
+    * @param {string} headerName
+    * @param {*} value
+    * @return {Object|null} The matching row object, or null.
+    */
+    function findRow(sheetName, headerName, value) {
+      const rows = getRows(sheetName);
+      for (let i = 0; i < rows.length; i++) {
+        if (rows[i][headerName] === value) return rows[i];
+      }
+      return null;
+    }
+
+    /**
+    * Returns true if a row exists where `headerName` equals `value`.
+    * @param {string} sheetName
+    * @param {string} headerName
+    * @param {*} value
+    * @return {boolean}
+    */
+    function exists(sheetName, headerName, value) {
+      return findRow(sheetName, headerName, value) !== null;
+    }
+
+    /**
+    * Returns every row for which `predicate(rowObject)` returns truthy.
+    * @param {string} sheetName
+    * @param {function(Object):boolean} predicate
+    * @return {Array<Object>}
+    */
+    function search(sheetName, predicate) {
+      return getRows(sheetName).filter(predicate);
+    }
+
+    // -------------------------------------------------------------------
+    // Metadata-specific convenience methods
+    // -------------------------------------------------------------------
+
+    /**
+    * Appends a new Metadata row for a freshly imported BIP e-mail.
+    * @param {Object} metadata Keyed by METADATA_HEADERS values. IMPORTED_AT
+    *   and UPDATED_AT are set automatically if omitted, REMINDER_COUNT
+    *   defaults to 0.
+    * @return {number} The row number written.
+    */
+    function saveMetadata(metadata) {
+      const now = new Date();
+      const payload = Object.assign({
+        [METADATA_HEADERS.IMPORTED_AT]: now,
+        [METADATA_HEADERS.UPDATED_AT]: now,
+        [METADATA_HEADERS.REMINDER_COUNT]: 0
+      }, metadata);
+      return appendRow(SHEET_NAMES.METADATA, payload);
+    }
+
+    /**
+    * Updates the Metadata row identified by Gmail Message ID, automatically
+    * bumping "Updated At" to now.
+    * @param {string} messageId
+    * @param {Object} updates Keyed by METADATA_HEADERS values.
+    */
+    function updateMetadata(messageId, updates) {
+      const row = findRow(SHEET_NAMES.METADATA, METADATA_HEADERS.MESSAGE_ID, messageId);
+      if (!row) {
+        throw new Error('SpreadsheetService.updateMetadata: no Metadata row found for Message ID "' + messageId + '".');
+      }
+      const payload = Object.assign({}, updates);
+      payload[METADATA_HEADERS.UPDATED_AT] = new Date();
+      updateRow(SHEET_NAMES.METADATA, row.__row, payload);
+    }
+
+    /**
+    * Returns the Metadata row for a given Gmail Message ID.
+    * @param {string} messageId
+    * @return {Object|null}
+    */
+    function getMetadata(messageId) {
+      return findRow(SHEET_NAMES.METADATA, METADATA_HEADERS.MESSAGE_ID, messageId);
+    }
+
+    // -------------------------------------------------------------------
+    // Validation / installation support
+    // -------------------------------------------------------------------
+
+    /**
+    * Validates that a sheet exists and that every expected header is
+    * present in its header row.
+    * @param {string} sheetName
+    * @param {Array<string>} expectedHeaders
+    * @return {{valid: boolean, missing: Array<string>}}
+    */
+    function validateSheet(sheetName, expectedHeaders) {
+      const sheet = Config.getSpreadsheet().getSheetByName(sheetName);
+      if (!sheet) {
+        return { valid: false, missing: expectedHeaders.slice() };
+      }
+      const headers = getHeaders(sheetName);
+      const missing = expectedHeaders.filter(function (h) { return headers.indexOf(h) === -1; });
+      return { valid: missing.length === 0, missing: missing };
+    }
+
+    /**
+    * Creates any sheet from ALL_SHEET_NAMES that does not yet exist in the
+    * spreadsheet. Does not touch sheets that already exist. Returns the
+    * list of sheet names that were created.
+    * @return {Array<string>}
+    */
+    function initializeMissingSheets() {
+      const spreadsheet = Config.getSpreadsheet();
+      const created = [];
+      ALL_SHEET_NAMES.forEach(function (name) {
+        if (!spreadsheet.getSheetByName(name)) {
+          spreadsheet.insertSheet(name);
+          created.push(name);
+        }
+      });
+      return created;
+    }
+
+    /**
+    * Returns basic statistics for a sheet: total data row count, and for
+    * the Main sheet specifically, a breakdown of rows per status value.
+    * @param {string} sheetName
+    * @return {Object}
+    */
+    function statistics(sheetName) {
+      const rows = getRows(sheetName);
+      const stats = { sheetName: sheetName, totalRows: rows.length };
+      if (sheetName === SHEET_NAMES.MAIN) {
+        const byStatus = {};
+        BIP_STATUS_VALUES.forEach(function (status) { byStatus[status] = 0; });
+        rows.forEach(function (row) {
+          const status = row[MAIN_HEADERS.STATUS];
+          if (status) {
+            byStatus[status] = (byStatus[status] || 0) + 1;
+          }
+        });
+        stats.byStatus = byStatus;
+      }
+      return stats;
+    }
+
+    return {
+      getSheet: getSheet,
+      getHeaders: getHeaders,
+      buildColumnMap: buildColumnMap,
+      getColumnMap: getColumnMap,
+      cacheColumnMap: cacheColumnMap,
+      getColumn: getColumn,
+      getRows: getRows,
+      appendRow: appendRow,
+      updateRow: updateRow,
+      deleteRow: deleteRow,
+      findRow: findRow,
+      exists: exists,
+      search: search,
+      saveMetadata: saveMetadata,
+      updateMetadata: updateMetadata,
+      getMetadata: getMetadata,
+      validateSheet: validateSheet,
+      initializeMissingSheets: initializeMissingSheets,
+      statistics: statistics
+    };
+
+  })();
+
+
+DriveService.gs
+
+  /**
+  * DriveService.gs
+  * ---------------------------------------------------------------------------
+  * The ONLY file in this project allowed to call DriveApp directly.
+  *
+  * Folder layout created by this service:
+  *
+  *   BIP Management System/              <- created by Config.getRootDriveFolderId()
+  *     BIP 2026-2027/                    <- DRIVE_BIP_SEASON_FOLDER_NAME (this file)
+  *       <BIP name - University>/        <- one folder per imported BIP e-mail
+  *         attachment1.pdf
+  *         attachment2.docx
+  * ---------------------------------------------------------------------------
+  */
+
+  const DriveService = (function () {
+
+    /**
+    * Returns the "BIP 2026-2027" season folder, creating it under the
+    * project's root Drive folder the first time it is needed.
+    * @return {Folder}
+    */
+    function getSeasonFolder() {
+      const rootFolder = DriveApp.getFolderById(Config.getRootDriveFolderId());
+      const existing = rootFolder.getFoldersByName(DRIVE_BIP_SEASON_FOLDER_NAME);
+      if (existing.hasNext()) {
+        return existing.next();
+      }
+      return rootFolder.createFolder(DRIVE_BIP_SEASON_FOLDER_NAME);
+    }
+
+    /**
+    * Builds a filesystem-safe folder name for a BIP from its name and
+    * inviting university, truncated to a sane length.
+    * @param {string} bipName
+    * @param {string} university
+    * @return {string}
+    */
+    function buildBipFolderName(bipName, university) {
+      const raw = [bipName, university].filter(function (v) { return !AppUtils.isEmpty(v); }).join(' - ');
+      const safe = AppUtils.collapseWhitespace(raw).replace(/[\\\/:*?"<>|]/g, '-');
+      const fallback = 'BIP-' + AppUtils.generateUUID().slice(0, 8);
+      const name = AppUtils.isEmpty(safe) ? fallback : safe;
+      return name.length > 120 ? name.slice(0, 120) : name;
+    }
+
+    /**
+    * Finds or creates the Drive folder for a single BIP inside the season
+    * folder. Re-using an existing folder with the same name prevents
+    * duplicate folders if an import is retried after a partial failure.
+    * @param {string} bipName
+    * @param {string} university
+    * @return {Folder}
+    */
+    function getOrCreateBipFolder(bipName, university) {
+      const seasonFolder = getSeasonFolder();
+      const folderName = buildBipFolderName(bipName, university);
+      const existing = seasonFolder.getFoldersByName(folderName);
+      if (existing.hasNext()) {
+        return existing.next();
+      }
+      return seasonFolder.createFolder(folderName);
+    }
+
+    /**
+    * Returns true if a file with the same name AND size already exists in
+    * the folder (used to avoid duplicate uploads on retry).
+    * @param {Folder} folder
+    * @param {string} name
+    * @param {number} size
+    * @return {File|null}
+    */
+    function findExistingFile(folder, name, size) {
+      const files = folder.getFilesByName(name);
+      while (files.hasNext()) {
+        const file = files.next();
+        if (file.getSize() === size) {
+          return file;
+        }
+      }
+      return null;
+    }
+
+    /**
+    * Uploads every attachment into the given folder, skipping any
+    * attachment that already exists there (same name + size).
+    * @param {Folder} folder
+    * @param {Array<{name: string, contentType: string, size: number, blob: Blob}>} attachments
+    * @return {Array<{name: string, url: string, fileId: string}>}
+    */
+    function uploadAttachments(folder, attachments) {
+      return attachments.map(function (attachment) {
+        let file = findExistingFile(folder, attachment.name, attachment.size);
+        if (!file) {
+          file = folder.createFile(attachment.blob);
+        }
+        return {
+          name: attachment.name,
+          url: file.getUrl(),
+          fileId: file.getId()
+        };
+      });
+    }
+
+    /**
+    * High-level entry point used by TriggerService: creates (or reuses) the
+    * Drive folder for a single imported BIP and uploads its e-mail
+    * attachments into it.
+    * @param {Object} emailData EmailData as produced by GmailService (uses .attachments).
+    * @param {string} bipName
+    * @param {string} university
+    * @return {{folderId: string, folderUrl: string, attachments: Array<{name:string,url:string,fileId:string}>}}
+    */
+    function createFolderAndUploadAttachments(emailData, bipName, university) {
+      const folder = getOrCreateBipFolder(bipName, university);
+      const uploaded = uploadAttachments(folder, emailData.attachments || []);
+      return {
+        folderId: folder.getId(),
+        folderUrl: folder.getUrl(),
+        attachments: uploaded
+      };
+    }
+
+    return {
+      getSeasonFolder: getSeasonFolder,
+      getOrCreateBipFolder: getOrCreateBipFolder,
+      uploadAttachments: uploadAttachments,
+      createFolderAndUploadAttachments: createFolderAndUploadAttachments
+    };
+
+  })();
+
+
+
+NotificationService.gs
+
+  /**
+  * NotificationService.gs
+  * ---------------------------------------------------------------------------
+  * Loads e-mail templates from the "Email Templates" sheet, replaces
+  * {{placeholder}} tokens, and sends HTML e-mails (with a plain-text
+  * fallback) to faculty coordinators via GmailApp.
+  *
+  * Recipients for a given BIP are the coordinators, from the "Faculty
+  * Coordinators" sheet, of every faculty that BIP was matched to by
+  * Parser.gs. All spreadsheet reads go through SpreadsheetService.
+  * ---------------------------------------------------------------------------
+  */
+
+  const NotificationService = (function () {
+
+    const PLACEHOLDER_PATTERN_CACHE = {};
+
+    /**
+    * Returns (and memoizes) a global regex that matches {{key}}, tolerant
+    * of surrounding whitespace inside the braces.
+    * @param {string} key
+    * @return {RegExp}
+    */
+    function placeholderPattern(key) {
+      if (!PLACEHOLDER_PATTERN_CACHE[key]) {
+        const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        PLACEHOLDER_PATTERN_CACHE[key] = new RegExp('{{\\s*' + escapedKey + '\\s*}}', 'g');
+      }
+      return PLACEHOLDER_PATTERN_CACHE[key];
+    }
+
+    /**
+    * Replaces every {{key}} occurrence in `text` with the corresponding
+    * value from `dataMap`. Keys with no matching data become an empty
+    * string rather than being left as a literal "{{key}}" in the e-mail.
+    * @param {string} text
+    * @param {Object<string,*>} dataMap
+    * @return {string}
+    */
+    function replacePlaceholders(text, dataMap) {
+      if (AppUtils.isEmpty(text)) return '';
+      let result = String(text);
+      Object.keys(dataMap).forEach(function (key) {
+        const value = dataMap[key];
+        result = result.replace(placeholderPattern(key), AppUtils.isEmpty(value) ? '' : String(value));
+      });
+      // Strip any placeholder that had no corresponding key at all.
+      result = result.replace(/{{\s*[a-zA-Z0-9_]+\s*}}/g, '');
+      return result;
+    }
+
+    /**
+    * Loads a template row by name from the Email Templates sheet and
+    * renders both subject and body with the given data.
+    * @param {string} templateName One of TEMPLATE_NAMES.
+    * @param {Object<string,*>} dataMap
+    * @return {{subject: string, bodyPlain: string}}
+    */
+    function renderTemplate(templateName, dataMap) {
+      const template = SpreadsheetService.findRow(SHEET_NAMES.EMAIL_TEMPLATES, EMAIL_TEMPLATES_HEADERS.TEMPLATE, templateName);
+      if (!template) {
+        throw new Error('NotificationService.renderTemplate: no template row found for "' + templateName + '" in the Email Templates sheet.');
+      }
+      return {
+        subject: replacePlaceholders(template[EMAIL_TEMPLATES_HEADERS.SUBJECT], dataMap),
+        bodyPlain: replacePlaceholders(template[EMAIL_TEMPLATES_HEADERS.BODY], dataMap)
+      };
+    }
+
+    /**
+    * Converts a rendered plain-text body into a safe HTML body: escapes
+    * HTML-significant characters, converts newlines to <br>, and turns bare
+    * http(s) URLs into clickable links.
+    * @param {string} plainText
+    * @return {string}
+    */
+    function buildHtmlBody(plainText) {
+      const escaped = AppUtils.escapeHtml(plainText);
+      const linkified = escaped.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1">$1</a>');
+      return linkified.replace(/\n/g, '<br>');
+    }
+
+    /**
+    * Returns the coordinator rows (Faculty Coordinators sheet) whose
+    * Faculty code is in `facultyCodes` and who have a syntactically valid
+    * e-mail address.
+    * @param {Array<string>} facultyCodes
+    * @return {Array<Object>}
+    */
+    function getCoordinatorsForFaculties(facultyCodes) {
+      if (AppUtils.isEmpty(facultyCodes)) return [];
+      return SpreadsheetService.search(SHEET_NAMES.FACULTY_COORDINATORS, function (row) {
+        return facultyCodes.indexOf(row[FACULTY_COORDINATORS_HEADERS.FACULTY]) !== -1 &&
+          AppUtils.isValidEmail(row[FACULTY_COORDINATORS_HEADERS.EMAIL]);
+      });
+    }
+
+    /**
+    * Formats a Main-sheet cell value that may hold a Date object or a
+    * plain string into display text.
+    * @param {*} value
+    * @return {string}
+    */
+    function formatCellValue(value) {
+      if (AppUtils.isEmpty(value)) return '';
+      return value instanceof Date ? AppUtils.formatDate(value) : String(value);
+    }
+
+    /**
+    * Sends one e-mail using a rendered template, with an HTML body built
+    * from the plain-text version.
+    * @param {string} toEmail
+    * @param {{subject: string, bodyPlain: string}} rendered
+    */
+    function dispatchEmail(toEmail, rendered) {
+      GmailApp.sendEmail(toEmail, rendered.subject, rendered.bodyPlain, {
+        htmlBody: buildHtmlBody(rendered.bodyPlain),
+        name: 'BIP Management System - STU'
+      });
+    }
+
+    /**
+    * Sends the NEW_BIP notification to every coordinator of every faculty
+    * this BIP was matched to.
+    * @param {Object} mainRow Row object as returned by SpreadsheetService (Main sheet).
+    * @param {Array<string>} facultyCodes Faculty codes this BIP is relevant to.
+    * @return {number} Number of e-mails actually sent.
+    */
+    function sendNewBipNotification(mainRow, facultyCodes) {
+      const coordinators = getCoordinatorsForFaculties(facultyCodes);
+      if (coordinators.length === 0) {
+        AppUtils.log(LOG_LEVEL.WARN, 'NotificationService', 'No valid faculty coordinator e-mails found for NEW_BIP notification.', facultyCodes);
+        return 0;
+      }
+
+      const baseData = {
+        university: mainRow[MAIN_HEADERS.UNIVERSITY],
+        level: mainRow[MAIN_HEADERS.LEVEL],
+        startDate: formatCellValue(mainRow[MAIN_HEADERS.START_DATE]),
+        endDate: formatCellValue(mainRow[MAIN_HEADERS.END_DATE]),
+        deadline: formatCellValue(mainRow[MAIN_HEADERS.DEADLINE]),
+        applicationMethod: mainRow[MAIN_HEADERS.APPLICATION_METHOD],
+        sheetUrl: Config.getSpreadsheet().getUrl()
+      };
+
+      let sentCount = 0;
+      coordinators.forEach(function (coordinator) {
+        const dataMap = Object.assign({}, baseData, {
+          coordinatorName: coordinator[FACULTY_COORDINATORS_HEADERS.FULL_NAME]
+        });
+        const rendered = renderTemplate(TEMPLATE_NAMES.NEW_BIP, dataMap);
+        dispatchEmail(coordinator[FACULTY_COORDINATORS_HEADERS.EMAIL], rendered);
+        sentCount++;
+      });
+
+      AppUtils.log(LOG_LEVEL.INFO, 'NotificationService', 'Sent NEW_BIP notifications.', { university: mainRow[MAIN_HEADERS.UNIVERSITY], count: sentCount });
+      return sentCount;
+    }
+
+    /**
+    * Sends the REMINDER notification to every coordinator of every faculty
+    * this BIP was matched to.
+    * @param {Object} mainRow Row object as returned by SpreadsheetService (Main sheet).
+    * @param {Array<string>} facultyCodes Faculty codes this BIP is relevant to.
+    * @return {number} Number of e-mails actually sent.
+    */
+    function sendReminderNotification(mainRow, facultyCodes) {
+      const coordinators = getCoordinatorsForFaculties(facultyCodes);
+      if (coordinators.length === 0) {
+        AppUtils.log(LOG_LEVEL.WARN, 'NotificationService', 'No valid faculty coordinator e-mails found for REMINDER notification.', facultyCodes);
+        return 0;
+      }
+
+      const baseData = {
+        university: mainRow[MAIN_HEADERS.UNIVERSITY],
+        deadline: formatCellValue(mainRow[MAIN_HEADERS.DEADLINE]),
+        sheetUrl: Config.getSpreadsheet().getUrl()
+      };
+
+      let sentCount = 0;
+      coordinators.forEach(function (coordinator) {
+        const dataMap = Object.assign({}, baseData, {
+          coordinatorName: coordinator[FACULTY_COORDINATORS_HEADERS.FULL_NAME]
+        });
+        const rendered = renderTemplate(TEMPLATE_NAMES.REMINDER, dataMap);
+        dispatchEmail(coordinator[FACULTY_COORDINATORS_HEADERS.EMAIL], rendered);
+        sentCount++;
+      });
+
+      AppUtils.log(LOG_LEVEL.INFO, 'NotificationService', 'Sent REMINDER notifications.', { university: mainRow[MAIN_HEADERS.UNIVERSITY], count: sentCount });
+      return sentCount;
+    }
+
+    return {
+      renderTemplate: renderTemplate,
+      getCoordinatorsForFaculties: getCoordinatorsForFaculties,
+      sendNewBipNotification: sendNewBipNotification,
+      sendReminderNotification: sendReminderNotification
+    };
+
+  })();
+
+
+ReminderService.gs
+
+  /**
+  * ReminderService.gs
+  * ---------------------------------------------------------------------------
+  * Scans the Main sheet for BIPs where no faculty has responded yet (all
+  * seven faculty columns are empty) and, at most once every
+  * REMINDER_INTERVAL_DAYS days, sends a reminder e-mail and increments the
+  * Reminder Count in the Metadata sheet.
+  *
+  * "Last reminder sent" is tracked via the Metadata row's Updated At field:
+  * it is set to the import time when a row is first created, and bumped to
+  * "now" every time a reminder is actually sent - so the interval check
+  * below naturally covers both "time since import" and "time since last
+  * reminder" with a single field.
+  * ---------------------------------------------------------------------------
+  */
+
+  const ReminderService = (function () {
+
+    const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+    /**
+    * Returns true if every one of the seven faculty columns on a Main row
+    * is empty, meaning no faculty has responded to this BIP yet.
+    * @param {Object} mainRow
+    * @return {boolean}
+    */
+    function hasNoFacultyResponse(mainRow) {
+      return FACULTY_COLUMNS.every(function (facultyCode) {
+        return AppUtils.isEmpty(mainRow[facultyCode]);
+      });
+    }
+
+    /**
+    * Returns true if two dates fall on the same calendar day (project
+    * timezone), used to guarantee at most one reminder per row per day
+    * even if the daily trigger somehow runs twice.
+    * @param {Date} a
+    * @param {Date} b
+    * @return {boolean}
+    */
+    function isSameDay(a, b) {
+      if (!(a instanceof Date) || !(b instanceof Date)) return false;
+      return AppUtils.formatDate(a, 'yyyy-MM-dd') === AppUtils.formatDate(b, 'yyyy-MM-dd');
+    }
+
+    /**
+    * Returns the whole number of days between `from` and `now` (now - from).
+    * @param {Date} from
+    * @param {Date} now
+    * @return {number}
+    */
+    function daysSince(from, now) {
+      if (!(from instanceof Date)) return Infinity;
+      return Math.floor((now.getTime() - from.getTime()) / MS_PER_DAY);
+    }
+
+    /**
+    * Determines the faculty codes a reminder should be sent to for a BIP.
+    * Uses the Fakulta column (comma-separated codes written by Parser.gs)
+    * rather than the per-faculty response columns, since the response
+    * columns are expected to be empty at this point (that's the trigger
+    * condition for sending a reminder in the first place).
+    * @param {Object} mainRow
+    * @return {Array<string>}
+    */
+    function getTargetFaculties(mainRow) {
+      const raw = mainRow[MAIN_HEADERS.FACULTY];
+      if (AppUtils.isEmpty(raw)) return [];
+      return String(raw)
+        .split(',')
+        .map(function (code) { return code.trim(); })
+        .filter(function (code) { return FACULTY_COLUMNS.indexOf(code) !== -1; });
+    }
+
+    /**
+    * Scans the Main sheet and sends reminders where due. Intended to be
+    * invoked once per day by TriggerService.runSendReminders().
+    * @return {{checked: number, sent: number, skipped: number}}
+    */
+    function checkAndSendReminders() {
+      const now = new Date();
+      const mainRows = SpreadsheetService.getRows(SHEET_NAMES.MAIN);
+
+      let checked = 0;
+      let sent = 0;
+      let skipped = 0;
+
+      mainRows.forEach(function (mainRow) {
+        const status = mainRow[MAIN_HEADERS.STATUS];
+        if (REMINDABLE_STATUSES.indexOf(status) === -1) return;
+        if (!hasNoFacultyResponse(mainRow)) return;
+
+        checked++;
+
+        const metadataRow = SpreadsheetService.findRow(SHEET_NAMES.METADATA, METADATA_HEADERS.MAIN_ROW_NUMBER, mainRow.__row);
+        if (!metadataRow) {
+          AppUtils.log(LOG_LEVEL.WARN, 'ReminderService', 'No Metadata row found for Main row ' + mainRow.__row + '; skipping reminder.');
+          skipped++;
+          return;
+        }
+
+        const lastUpdatedAt = metadataRow[METADATA_HEADERS.UPDATED_AT];
+
+        if (isSameDay(lastUpdatedAt, now)) {
+          skipped++; // already touched today - never send twice in one day
+          return;
+        }
+
+        if (daysSince(lastUpdatedAt, now) < REMINDER_INTERVAL_DAYS) {
+          skipped++; // not due yet
+          return;
+        }
+
+        const facultyCodes = getTargetFaculties(mainRow);
+        if (facultyCodes.length === 0) {
+          AppUtils.log(LOG_LEVEL.WARN, 'ReminderService', 'Main row ' + mainRow.__row + ' has no recognizable target faculties; skipping reminder.');
+          skipped++;
+          return;
+        }
+
+        try {
+          const sentCount = NotificationService.sendReminderNotification(mainRow, facultyCodes);
+          if (sentCount > 0) {
+            const currentCount = Number(metadataRow[METADATA_HEADERS.REMINDER_COUNT]) || 0;
+            SpreadsheetService.updateMetadata(metadataRow[METADATA_HEADERS.MESSAGE_ID], {
+              [METADATA_HEADERS.REMINDER_COUNT]: currentCount + 1
+            });
+            sent++;
+          } else {
+            skipped++;
+          }
+        } catch (e) {
+          AppUtils.log(LOG_LEVEL.ERROR, 'ReminderService', 'Failed to send reminder for Main row ' + mainRow.__row + '.', e.message);
+          skipped++;
+        }
+      });
+
+      AppUtils.log(LOG_LEVEL.INFO, 'ReminderService', 'Reminder check finished.', { checked: checked, sent: sent, skipped: skipped });
+      return { checked: checked, sent: sent, skipped: skipped };
+    }
+
+    return {
+      checkAndSendReminders: checkAndSendReminders,
+      hasNoFacultyResponse: hasNoFacultyResponse
+    };
+
+  })();
+
+
+
+TriggerService.gs
+
+  /**
+  * TriggerService.gs
+  * ---------------------------------------------------------------------------
+  * Owns the time-driven triggers installed by Installer.installTriggers():
+  *   - importGmail()      hourly  - full Gmail -> Gemini -> Sheet -> Drive -> Notification pipeline
+  *   - sendReminders()     daily  - delegates to ReminderService
+  *   - updateDeadlines()   daily  - flags overdue BIPs as expired
+  *
+  * These three function names are global (not nested in an object) because
+  * Apps Script time-driven triggers are bound to a top-level function name
+  * string (see TRIGGER_HANDLERS in Constants.gs). Each one simply delegates
+  * to the TriggerService namespace so the actual logic stays testable and
+  * consistent with the rest of the project's architecture.
+  * ---------------------------------------------------------------------------
+  */
+
+  const TriggerService = (function () {
+
+    /**
+    * Imports a single e-mail end-to-end: Gemini extraction, parsing, Main
+    * row creation, Drive folder + attachments, Metadata, notification, and
+    * finally marking the Gmail message as processed.
+    *
+    * Any failure part-way through leaves the message under the
+    * new-bips label (it is NOT marked processed), so the next hourly run
+    * will retry it automatically.
+    *
+    * @param {Object} emailData EmailData as produced by GmailService.
+    * @return {boolean} true if the e-mail was fully imported.
+    */
+    function importSingleEmail(emailData) {
+      const geminiData = GeminiService.extractBipData(emailData);
+      const parsed = Parser.parseGeminiResponse(geminiData);
+
+      if (!parsed.valid) {
+        AppUtils.log(LOG_LEVEL.WARN, 'TriggerService', 'Parsed BIP is missing required fields; importing anyway for manual review.', {
+          subject: emailData.subject,
+          missing: parsed.missing
+        });
+      }
+
+      const rowNumber = SpreadsheetService.appendRow(SHEET_NAMES.MAIN, parsed.row);
+
+      const driveInfo = DriveService.createFolderAndUploadAttachments(
+        emailData,
+        parsed.row[MAIN_HEADERS.BIP],
+        parsed.row[MAIN_HEADERS.UNIVERSITY]
+      );
+
+      SpreadsheetService.updateRow(SHEET_NAMES.MAIN, rowNumber, {
+        [MAIN_HEADERS.FILE]: driveInfo.folderUrl
+      });
+
+      SpreadsheetService.saveMetadata({
+        [METADATA_HEADERS.MESSAGE_ID]: emailData.messageId,
+        [METADATA_HEADERS.THREAD_ID]: emailData.threadId,
+        [METADATA_HEADERS.MAIN_ROW_NUMBER]: rowNumber,
+        [METADATA_HEADERS.GMAIL_URL]: emailData.gmailUrl,
+        [METADATA_HEADERS.DRIVE_FOLDER_URL]: driveInfo.folderUrl
+      });
+
+      try {
+        NotificationService.sendNewBipNotification(parsed.row, parsed.faculties);
+      } catch (e) {
+        // A notification failure should not block the import itself - the
+        // row, attachments and metadata are already safely saved. Log and
+        // continue so the message still gets marked as processed.
+        AppUtils.log(LOG_LEVEL.ERROR, 'TriggerService', 'NEW_BIP notification failed after successful import.', e.message);
+      }
+
+      GmailService.markMessageProcessed(emailData.message);
+
+      AppUtils.log(LOG_LEVEL.INFO, 'TriggerService', 'Imported BIP e-mail successfully.', {
+        subject: emailData.subject,
+        university: parsed.row[MAIN_HEADERS.UNIVERSITY],
+        row: rowNumber
+      });
+
+      return true;
+    }
+
+    /**
+    * Hourly pipeline: fetches every unimported e-mail under the BIP label
+    * and imports them one at a time. A failure on one e-mail is logged and
+    * does not stop the remaining e-mails in the batch from being processed.
+    * @return {{imported: number, failed: number, total: number}}
+    */
+    function runImportGmail() {
+      const emails = GmailService.fetchNewBipMessages();
+      let imported = 0;
+      let failed = 0;
+
+      emails.forEach(function (emailData) {
+        try {
+          importSingleEmail(emailData);
+          imported++;
+        } catch (e) {
+          failed++;
+          AppUtils.log(LOG_LEVEL.ERROR, 'TriggerService', 'Failed to import BIP e-mail; it will be retried on the next run.', {
+            subject: emailData.subject,
+            messageId: emailData.messageId,
+            error: e.message
+          });
+        }
+      });
+
+      AppUtils.log(LOG_LEVEL.INFO, 'TriggerService', 'Gmail import run finished.', { total: emails.length, imported: imported, failed: failed });
+      return { imported: imported, failed: failed, total: emails.length };
+    }
+
+    /**
+    * Daily reminder pipeline: delegates entirely to ReminderService.
+    * @return {{checked: number, sent: number, skipped: number}}
+    */
+    function runSendReminders() {
+      return ReminderService.checkAndSendReminders();
+    }
+
+    /**
+    * Daily deadline-maintenance pipeline: any Main row whose Deadline date
+    * has passed and whose Status is still NEW or AWAITING_RESPONSE is
+    * flipped to EXPIRED, so ReminderService stops chasing dead deadlines
+    * and the dashboard reflects reality.
+    * @return {{checked: number, expired: number}}
+    */
+    function runUpdateDeadlines() {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      const mainRows = SpreadsheetService.getRows(SHEET_NAMES.MAIN);
+      let checked = 0;
+      let expired = 0;
+
+      mainRows.forEach(function (mainRow) {
+        const status = mainRow[MAIN_HEADERS.STATUS];
+        if (REMINDABLE_STATUSES.indexOf(status) === -1) return;
+
+        checked++;
+
+        const deadline = mainRow[MAIN_HEADERS.DEADLINE];
+        if (!(deadline instanceof Date)) return;
+
+        const deadlineDay = new Date(deadline.getFullYear(), deadline.getMonth(), deadline.getDate());
+        if (deadlineDay.getTime() < today.getTime()) {
+          SpreadsheetService.updateRow(SHEET_NAMES.MAIN, mainRow.__row, {
+            [MAIN_HEADERS.STATUS]: BIP_STATUS.EXPIRED
+          });
+          expired++;
+        }
+      });
+
+      AppUtils.log(LOG_LEVEL.INFO, 'TriggerService', 'Deadline update run finished.', { checked: checked, expired: expired });
+      return { checked: checked, expired: expired };
+    }
+
+    return {
+      runImportGmail: runImportGmail,
+      runSendReminders: runSendReminders,
+      runUpdateDeadlines: runUpdateDeadlines
+    };
+
+  })();
+
+  /**
+  * Time-driven trigger handler (hourly). Imports every new BIP e-mail
+  * end-to-end. See TriggerService.runImportGmail for details.
+  */
+  function importGmail() {
+    TriggerService.runImportGmail();
+  }
+
+  /**
+  * Time-driven trigger handler (daily). Sends reminder e-mails for BIPs
+  * awaiting a faculty response. See TriggerService.runSendReminders.
+  */
+  function sendReminders() {
+    TriggerService.runSendReminders();
+  }
+
+  /**
+  * Time-driven trigger handler (daily). Marks overdue BIPs as expired.
+  * See TriggerService.runUpdateDeadlines.
+  */
+  function updateDeadlines() {
+    TriggerService.runUpdateDeadlines();
+  }
+
+
+
+DashboardService.gs
+
+  /**
+  * DashboardService.gs
+  * ---------------------------------------------------------------------------
+  * Read-model / aggregation layer for the International Relations Office
+  * dashboard. Every function here is a pure read (except updateBipStatus and
+  * upsertSetting, the only two write paths) built entirely on top of
+  * SpreadsheetService, ReminderService and AppUtils - this file never calls
+  * SpreadsheetApp, DriveApp or GmailApp directly, and never re-implements
+  * logic that already exists elsewhere (e.g. reminder eligibility is reused
+  * from ReminderService.hasNoFacultyResponse rather than re-derived here).
+  *
+  * Router.gs is the only file that should call into DashboardService; it is
+  * responsible for turning HTTP/RPC parameters into the typed arguments the
+  * functions below expect, and for wrapping results/errors into the API
+  * envelope.
+  *
+  * Row identifiers: every BIP is identified by its Main-sheet 1-based row
+  * number (the same "__row" property SpreadsheetService already attaches to
+  * every row object). This matches the identifier scheme already used by
+  * SpreadsheetService.updateRow/deleteRow, so no new ID scheme is introduced.
+  *
+  * KNOWN LIMITATION - "countries": the Main sheet has no country column and
+  * GeminiService's extraction schema does not ask for one, so no reliable
+  * per-country data exists anywhere in the project. getCountryStats() below
+  * deliberately returns an empty, clearly-labelled result rather than
+  * guessing a country from the university name. Add a Country column (Main
+  * sheet + GeminiService prompt + Parser) first if real country stats are
+  * needed - that is a schema change outside the scope of this file.
+  * ---------------------------------------------------------------------------
+  */
+
+  const DashboardService = (function () {
+
+    const DEFAULT_RECENT_LIMIT = 10;
+    const DEFAULT_DEADLINE_WINDOW_DAYS = 14;
+    const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+    // -------------------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------------------
+
+    /**
+    * Builds a map of Main row number -> Metadata row object, so BIP/Metadata
+    * joins are O(1) per row instead of re-scanning the Metadata sheet for
+    * every Main row (SpreadsheetService.findRow is O(n) per call).
+    * @return {Object<number,Object>}
+    */
+    function buildMetadataIndexByMainRow() {
+      const index = {};
+      SpreadsheetService.getRows(SHEET_NAMES.METADATA).forEach(function (meta) {
+        const mainRowNumber = Number(meta[METADATA_HEADERS.MAIN_ROW_NUMBER]);
+        if (!isNaN(mainRowNumber)) {
+          index[mainRowNumber] = meta;
+        }
+      });
+      return index;
+    }
+
+    /**
+    * Formats a Main-sheet cell that may be a Date object or a plain string
+    * into a stable display string, and passes through non-date values
+    * unchanged. Dates are also returned in ISO form under a companion key by
+    * callers that need to sort/compare, since string display format
+    * ('dd.MM.yyyy') does not sort correctly.
+    * @param {*} value
+    * @return {string}
+    */
+    function formatCellValue(value) {
+      if (AppUtils.isEmpty(value)) return '';
+      return value instanceof Date ? AppUtils.formatDate(value) : String(value);
+    }
+
+    /**
+    * Converts a raw Main row object into the compact "BipSummary" shape used
+    * by list views (dashboard, search, recent). Full detail (Metadata,
+    * per-faculty response marks) is only attached by buildBipDetail().
+    * @param {Object} mainRow
+    * @return {Object}
+    */
+    function toBipSummary(mainRow) {
+      return {
+        rowNumber: mainRow.__row,
+        bipName: mainRow[MAIN_HEADERS.BIP] || '',
+        university: mainRow[MAIN_HEADERS.UNIVERSITY] || '',
+        level: mainRow[MAIN_HEADERS.LEVEL] || '',
+        startDate: formatCellValue(mainRow[MAIN_HEADERS.START_DATE]),
+        endDate: formatCellValue(mainRow[MAIN_HEADERS.END_DATE]),
+        deadline: formatCellValue(mainRow[MAIN_HEADERS.DEADLINE]),
+        deadlineRaw: mainRow[MAIN_HEADERS.DEADLINE] instanceof Date ? mainRow[MAIN_HEADERS.DEADLINE].getTime() : null,
+        faculties: AppUtils.isEmpty(mainRow[MAIN_HEADERS.FACULTY])
+          ? []
+          : String(mainRow[MAIN_HEADERS.FACULTY]).split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s !== ''; }),
+        studentCount: mainRow[MAIN_HEADERS.STUDENT_COUNT] || '',
+        status: mainRow[MAIN_HEADERS.STATUS] || '',
+        fileUrl: mainRow[MAIN_HEADERS.FILE] || ''
+      };
+    }
+
+    /**
+    * Builds the full "BipDetail" shape for a single Main row: everything in
+    * BipSummary plus long-text fields, per-faculty response marks and the
+    * joined Metadata row (Gmail/Drive links, import/update timestamps,
+    * reminder count).
+    * @param {Object} mainRow
+    * @param {Object|null} metadataRow
+    * @return {Object}
+    */
+    function toBipDetail(mainRow, metadataRow) {
+      const summary = toBipSummary(mainRow);
+
+      const facultyResponses = {};
+      FACULTY_COLUMNS.forEach(function (code) {
+        facultyResponses[code] = mainRow[code] || '';
+      });
+
+      return Object.assign(summary, {
+        applicationMethod: mainRow[MAIN_HEADERS.APPLICATION_METHOD] || '',
+        requirements: mainRow[MAIN_HEADERS.REQUIREMENTS] || '',
+        details: mainRow[MAIN_HEADERS.DETAILS] || '',
+        notes: mainRow[MAIN_HEADERS.NOTES] || '',
+        facultyResponses: facultyResponses,
+        metadata: metadataRow ? {
+          gmailUrl: metadataRow[METADATA_HEADERS.GMAIL_URL] || '',
+          driveFolderUrl: metadataRow[METADATA_HEADERS.DRIVE_FOLDER_URL] || '',
+          importedAt: formatCellValue(metadataRow[METADATA_HEADERS.IMPORTED_AT]),
+          updatedAt: formatCellValue(metadataRow[METADATA_HEADERS.UPDATED_AT]),
+          reminderCount: Number(metadataRow[METADATA_HEADERS.REMINDER_COUNT]) || 0
+        } : null
+      });
+    }
+
+    /**
+    * Computes the { [statusValue]: count } breakdown for the Main sheet,
+    * delegating the actual scan to SpreadsheetService.statistics so the
+    * counting logic itself lives in exactly one place.
+    * @return {Object<string,number>}
+    */
+    function computeStatusSummary() {
+      return SpreadsheetService.statistics(SHEET_NAMES.MAIN).byStatus;
+    }
+
+    /**
+    * Computes per-faculty invitation counts from the Fakulta summary column
+    * (the same source ReminderService.getTargetFaculties uses), broken down
+    * by the status of the BIPs each faculty was invited to.
+    * @param {Array<Object>} mainRows Already-fetched Main rows (avoids a
+    *   second full sheet read when called from getDashboardOverview).
+    * @return {Array<{code: string, fullName: string, invited: number, byStatus: Object<string,number>}>}
+    */
+    function computeFacultyStatistics(mainRows) {
+      const stats = {};
+      FACULTY_COLUMNS.forEach(function (code) {
+        stats[code] = { code: code, fullName: FACULTY_FULL_NAMES[code], invited: 0, byStatus: {} };
+        BIP_STATUS_VALUES.forEach(function (status) { stats[code].byStatus[status] = 0; });
+      });
+
+      mainRows.forEach(function (row) {
+        const faculty = row[MAIN_HEADERS.FACULTY];
+        if (AppUtils.isEmpty(faculty)) return;
+        const status = row[MAIN_HEADERS.STATUS];
+        String(faculty).split(',').forEach(function (rawCode) {
+          const code = rawCode.trim();
+          if (!stats[code]) return; // ignore anything not in FACULTY_COLUMNS
+          stats[code].invited++;
+          if (status && stats[code].byStatus[status] !== undefined) {
+            stats[code].byStatus[status]++;
+          }
+        });
+      });
+
+      return FACULTY_COLUMNS.map(function (code) { return stats[code]; });
+    }
+
+    /**
+    * Returns Main rows sorted by their joined Metadata "Imported At"
+    * timestamp, most recent first. Rows without a Metadata match (should not
+    * normally happen, but TriggerService failures can leave a Main row
+    * without Metadata if the crash happens between appendRow and
+    * saveMetadata) sort last.
+    * @param {Array<Object>} mainRows
+    * @param {Object<number,Object>} metadataIndex
+    * @param {number} limit
+    * @return {Array<Object>} Array of { summary, importedAt } pairs.
+    */
+    function sortByImportRecency(mainRows, metadataIndex, limit) {
+      const withMeta = mainRows.map(function (row) {
+        const meta = metadataIndex[row.__row] || null;
+        const importedAt = meta && meta[METADATA_HEADERS.IMPORTED_AT] instanceof Date
+          ? meta[METADATA_HEADERS.IMPORTED_AT].getTime()
+          : -1;
+        return { row: row, meta: meta, importedAt: importedAt };
+      });
+
+      withMeta.sort(function (a, b) { return b.importedAt - a.importedAt; });
+
+      return withMeta.slice(0, limit).map(function (entry) {
+        const summary = toBipSummary(entry.row);
+        summary.importedAt = entry.meta ? formatCellValue(entry.meta[METADATA_HEADERS.IMPORTED_AT]) : '';
+        return summary;
+      });
+    }
+
+    // -------------------------------------------------------------------
+    // Public read API
+    // -------------------------------------------------------------------
+
+    /**
+    * Returns every distinct status value with its current row count on the
+    * Main sheet, including zero-count statuses (so the UI can render a
+    * complete legend without special-casing missing keys).
+    * @return {Object<string,number>}
+    */
+    function getStatusSummary() {
+      return computeStatusSummary();
+    }
+
+    /**
+    * Returns per-faculty invitation counts and their status breakdown.
+    * @return {Array<Object>}
+    */
+    function getFacultyStatistics() {
+      return computeFacultyStatistics(SpreadsheetService.getRows(SHEET_NAMES.MAIN));
+    }
+
+    /**
+    * Placeholder for country statistics. See the KNOWN LIMITATION note at
+    * the top of this file: there is no country field anywhere in the
+    * project's data model, so this intentionally returns an empty,
+    * self-documenting result instead of guessing.
+    * @return {{available: boolean, note: string, data: Array}}
+    */
+    function getCountryStats() {
+      return {
+        available: false,
+        note: 'Country is not tracked in the Main sheet or the Gemini extraction schema. Add a Country column and update GeminiService/Parser to populate real country statistics.',
+        data: []
+      };
+    }
+
+    /**
+    * Returns every distinct partner university on the Main sheet with a
+    * count of BIPs from that university, sorted alphabetically.
+    * @return {Array<{university: string, count: number}>}
+    */
+    function getUniversities() {
+      const counts = {};
+      SpreadsheetService.getRows(SHEET_NAMES.MAIN).forEach(function (row) {
+        const university = row[MAIN_HEADERS.UNIVERSITY];
+        if (AppUtils.isEmpty(university)) return;
+        counts[university] = (counts[university] || 0) + 1;
+      });
+      return Object.keys(counts)
+        .sort(function (a, b) { return a.localeCompare(b); })
+        .map(function (university) { return { university: university, count: counts[university] }; });
+    }
+
+    /**
+    * Returns the filter facets used by the search UI: known statuses,
+    * known faculty codes, and every distinct university currently on file.
+    * @return {{statuses: Array<string>, faculties: Array<{code:string,fullName:string}>, universities: Array<string>}}
+    */
+    function getFilterOptions() {
+      return {
+        statuses: BIP_STATUS_VALUES,
+        faculties: FACULTY_COLUMNS.map(function (code) { return { code: code, fullName: FACULTY_FULL_NAMES[code] }; }),
+        universities: getUniversities().map(function (u) { return u.university; })
+      };
+    }
+
+    /**
+    * Returns the most recently imported BIPs, newest first, joined against
+    * Metadata for the actual import timestamp (rather than assuming sheet
+    * row order reflects import order, which would break if rows are ever
+    * manually reordered).
+    * @param {number=} limit Defaults to DEFAULT_RECENT_LIMIT.
+    * @return {Array<Object>}
+    */
+    function getRecentBips(limit) {
+      const mainRows = SpreadsheetService.getRows(SHEET_NAMES.MAIN);
+      const metadataIndex = buildMetadataIndexByMainRow();
+      return sortByImportRecency(mainRows, metadataIndex, limit || DEFAULT_RECENT_LIMIT);
+    }
+
+    /**
+    * Returns Main rows whose Deadline falls within the next `daysAhead`
+    * days (inclusive of today), excluding BIPs already in a terminal state
+    * (CONFIRMED, DECLINED, EXPIRED, CLOSED), sorted by soonest deadline
+    * first.
+    * @param {number=} daysAhead Defaults to DEFAULT_DEADLINE_WINDOW_DAYS.
+    * @return {Array<Object>}
+    */
+    function getUpcomingDeadlines(daysAhead) {
+      const window = daysAhead || DEFAULT_DEADLINE_WINDOW_DAYS;
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const cutoff = new Date(today.getTime() + window * MS_PER_DAY);
+
+      const rows = SpreadsheetService.getRows(SHEET_NAMES.MAIN).filter(function (row) {
+        if (REMINDABLE_STATUSES.indexOf(row[MAIN_HEADERS.STATUS]) === -1) return false;
+        const deadline = row[MAIN_HEADERS.DEADLINE];
+        if (!(deadline instanceof Date)) return false;
+        const deadlineDay = new Date(deadline.getFullYear(), deadline.getMonth(), deadline.getDate());
+        return deadlineDay.getTime() >= today.getTime() && deadlineDay.getTime() <= cutoff.getTime();
+      });
+
+      rows.sort(function (a, b) {
+        return a[MAIN_HEADERS.DEADLINE].getTime() - b[MAIN_HEADERS.DEADLINE].getTime();
+      });
+
+      return rows.map(toBipSummary);
+    }
+
+    /**
+    * Returns Main rows that are currently eligible for a reminder, i.e. the
+    * same predicate ReminderService.checkAndSendReminders uses
+    * (REMINDABLE_STATUSES + ReminderService.hasNoFacultyResponse), reused
+    * here read-only so this list never sends anything itself.
+    *
+    * IMPORTANT: this reuses ReminderService.hasNoFacultyResponse as-is, so
+    * it inherits that function's existing semantics unchanged. See the
+    * "Faculty response semantics" note in the architecture review for a
+    * data-model ambiguity between Parser.gs and ReminderService.gs that
+    * affects what this list actually contains - that is a pre-existing
+    * question about the Main sheet's data model, not something introduced
+    * by this file.
+    * @return {Array<Object>}
+    */
+    function getUpcomingReminders() {
+      const metadataIndex = buildMetadataIndexByMainRow();
+
+      const rows = SpreadsheetService.getRows(SHEET_NAMES.MAIN).filter(function (row) {
+        return REMINDABLE_STATUSES.indexOf(row[MAIN_HEADERS.STATUS]) !== -1 &&
+          ReminderService.hasNoFacultyResponse(row);
+      });
+
+      return rows.map(function (row) {
+        const summary = toBipSummary(row);
+        const meta = metadataIndex[row.__row];
+        const lastUpdatedAt = meta ? meta[METADATA_HEADERS.UPDATED_AT] : null;
+        const daysSinceLastTouch = lastUpdatedAt instanceof Date
+          ? Math.floor((Date.now() - lastUpdatedAt.getTime()) / MS_PER_DAY)
+          : null;
+        summary.reminderCount = meta ? (Number(meta[METADATA_HEADERS.REMINDER_COUNT]) || 0) : 0;
+        summary.daysSinceLastTouch = daysSinceLastTouch;
+        summary.dueNow = daysSinceLastTouch !== null && daysSinceLastTouch >= REMINDER_INTERVAL_DAYS;
+        return summary;
+      }).sort(function (a, b) {
+        return (b.daysSinceLastTouch || 0) - (a.daysSinceLastTouch || 0);
+      });
+    }
+
+    /**
+    * Full-text (substring, case-insensitive) search across BIP name,
+    * university, details and notes, combined with optional status/faculty/
+    * university filters and a deadline date range. Returns matching results
+    * together with the current filter facets so the UI can keep its dropdown
+    * options in sync with the data in a single round trip.
+    * @param {Object} criteria
+    * @param {string=} criteria.query
+    * @param {string=} criteria.status One of BIP_STATUS_VALUES.
+    * @param {string=} criteria.faculty One of FACULTY_COLUMNS.
+    * @param {string=} criteria.university Exact match against MAIN_HEADERS.UNIVERSITY.
+    * @param {string=} criteria.deadlineFrom Date string parseable by AppUtils.parseDate.
+    * @param {string=} criteria.deadlineTo Date string parseable by AppUtils.parseDate.
+    * @param {number=} criteria.limit Defaults to 50.
+    * @param {number=} criteria.offset Defaults to 0.
+    * @return {{results: Array<Object>, total: number, facets: Object}}
+    */
+    function searchBips(criteria) {
+      const opts = criteria || {};
+      const query = AppUtils.isEmpty(opts.query) ? '' : String(opts.query).trim().toLowerCase();
+      const status = AppUtils.isEmpty(opts.status) ? null : opts.status;
+      const faculty = AppUtils.isEmpty(opts.faculty) ? null : opts.faculty;
+      const university = AppUtils.isEmpty(opts.university) ? null : opts.university;
+      const deadlineFrom = AppUtils.isEmpty(opts.deadlineFrom) ? null : AppUtils.parseDate(opts.deadlineFrom);
+      const deadlineTo = AppUtils.isEmpty(opts.deadlineTo) ? null : AppUtils.parseDate(opts.deadlineTo);
+      const limit = opts.limit ? Math.max(1, Math.min(Number(opts.limit) || 50, 200)) : 50;
+      const offset = opts.offset ? Math.max(0, Number(opts.offset) || 0) : 0;
+
+      if (status && BIP_STATUS_VALUES.indexOf(status) === -1) {
+        throw new Error('DashboardService.searchBips: unknown status "' + status + '".');
+      }
+      if (faculty && FACULTY_COLUMNS.indexOf(faculty) === -1) {
+        throw new Error('DashboardService.searchBips: unknown faculty code "' + faculty + '".');
+      }
+
+      const matched = SpreadsheetService.getRows(SHEET_NAMES.MAIN).filter(function (row) {
+        if (status && row[MAIN_HEADERS.STATUS] !== status) return false;
+        if (university && row[MAIN_HEADERS.UNIVERSITY] !== university) return false;
+
+        if (faculty) {
+          const invited = row[MAIN_HEADERS.FACULTY];
+          const codes = AppUtils.isEmpty(invited) ? [] : String(invited).split(',').map(function (s) { return s.trim(); });
+          if (codes.indexOf(faculty) === -1) return false;
+        }
+
+        if (deadlineFrom || deadlineTo) {
+          const deadline = row[MAIN_HEADERS.DEADLINE];
+          if (!(deadline instanceof Date)) return false;
+          if (deadlineFrom && deadline.getTime() < deadlineFrom.getTime()) return false;
+          if (deadlineTo && deadline.getTime() > deadlineTo.getTime()) return false;
+        }
+
+        if (query) {
+          const haystack = [
+            row[MAIN_HEADERS.BIP], row[MAIN_HEADERS.UNIVERSITY],
+            row[MAIN_HEADERS.DETAILS], row[MAIN_HEADERS.NOTES]
+          ].filter(function (v) { return !AppUtils.isEmpty(v); }).join(' \n ').toLowerCase();
+          if (haystack.indexOf(query) === -1) return false;
+        }
+
+        return true;
+      });
+
+      const page = matched.slice(offset, offset + limit).map(toBipSummary);
+
+      return {
+        results: page,
+        total: matched.length,
+        facets: getFilterOptions()
+      };
+    }
+
+    /**
+    * Returns the full detail record for a single BIP by Main-sheet row
+    * number, joined with its Metadata row.
+    * @param {number} rowNumber
+    * @return {Object}
+    */
+    function getBipDetails(rowNumber) {
+      const row = Number(rowNumber);
+      if (!row || row <= MAIN_HEADER_ROW) {
+        throw new Error('DashboardService.getBipDetails: invalid row number "' + rowNumber + '".');
+      }
+
+      const mainRow = SpreadsheetService.getRows(SHEET_NAMES.MAIN).find(function (r) { return r.__row === row; });
+      if (!mainRow) {
+        throw new Error('DashboardService.getBipDetails: no BIP found at row ' + row + '.');
+      }
+
+      const metadataRow = SpreadsheetService.findRow(SHEET_NAMES.METADATA, METADATA_HEADERS.MAIN_ROW_NUMBER, row);
+      return toBipDetail(mainRow, metadataRow);
+    }
+
+    /**
+    * Returns the full dashboard overview payload in a single call: status
+    * summary, faculty statistics, recent BIPs, upcoming deadlines, upcoming
+    * reminders and top-line totals. Cached for CACHE_TTL_SECONDS.DASHBOARD_STATS
+    * seconds since it aggregates the whole Main sheet and is the initial
+    * payload for every dashboard page load.
+    * @param {boolean=} forceRefresh Bypasses the cache when true.
+    * @return {Object}
+    */
+    function getDashboardOverview(forceRefresh) {
+      if (!forceRefresh) {
+        const cached = Config.cacheGet(CACHE_KEYS.DASHBOARD_STATS);
+        if (cached) return cached;
+      }
+
+      const mainRows = SpreadsheetService.getRows(SHEET_NAMES.MAIN);
+      const metadataIndex = buildMetadataIndexByMainRow();
+      const statusSummary = computeStatusSummary();
+
+      const totalBips = mainRows.length;
+      const activeBips = (statusSummary[BIP_STATUS.NEW] || 0) + (statusSummary[BIP_STATUS.AWAITING_RESPONSE] || 0);
+
+      const overview = {
+        generatedAt: new Date().toISOString(),
+        totals: {
+          totalBips: totalBips,
+          activeBips: activeBips,
+          confirmedBips: statusSummary[BIP_STATUS.CONFIRMED] || 0,
+          expiredBips: statusSummary[BIP_STATUS.EXPIRED] || 0,
+          totalUniversities: Object.keys(mainRows.reduce(function (acc, r) {
+            if (!AppUtils.isEmpty(r[MAIN_HEADERS.UNIVERSITY])) acc[r[MAIN_HEADERS.UNIVERSITY]] = true;
+            return acc;
+          }, {})).length
+        },
+        statusSummary: statusSummary,
+        facultyStatistics: computeFacultyStatistics(mainRows),
+        recentBips: sortByImportRecency(mainRows, metadataIndex, DEFAULT_RECENT_LIMIT),
+        upcomingDeadlines: getUpcomingDeadlines(DEFAULT_DEADLINE_WINDOW_DAYS),
+        upcomingReminders: getUpcomingReminders().slice(0, DEFAULT_RECENT_LIMIT)
+      };
+
+      Config.cachePut(CACHE_KEYS.DASHBOARD_STATS, overview, CACHE_TTL_SECONDS.DASHBOARD_STATS);
+      return overview;
+    }
+
+    /**
+    * Clears the cached dashboard overview so the next call to
+    * getDashboardOverview() recomputes fresh data. Call this after any
+    * mutation that affects dashboard numbers (status update, manual import,
+    * manual reminder run).
+    */
+    function invalidateOverviewCache() {
+      Config.cacheRemove(CACHE_KEYS.DASHBOARD_STATS);
+    }
+
+    // -------------------------------------------------------------------
+    // Public write API
+    // -------------------------------------------------------------------
+
+    /**
+    * Updates a BIP's status after validating both the row and the target
+    * status, then invalidates the dashboard cache.
+    * @param {number} rowNumber
+    * @param {string} newStatus One of BIP_STATUS_VALUES.
+    * @return {Object} The updated BipDetail.
+    */
+    function updateBipStatus(rowNumber, newStatus) {
+      if (BIP_STATUS_VALUES.indexOf(newStatus) === -1) {
+        throw new Error('DashboardService.updateBipStatus: "' + newStatus + '" is not a valid status. Expected one of: ' + BIP_STATUS_VALUES.join(', '));
+      }
+      // getBipDetails() validates the row exists before we write to it.
+      getBipDetails(rowNumber);
+
+      SpreadsheetService.updateRow(SHEET_NAMES.MAIN, Number(rowNumber), {
+        [MAIN_HEADERS.STATUS]: newStatus
+      });
+
+      invalidateOverviewCache();
+      return getBipDetails(rowNumber);
+    }
+
+    /**
+    * Returns every row of the Settings sheet.
+    * @return {Array<Object>}
+    */
+    function getSettings() {
+      return SpreadsheetService.getRows(SHEET_NAMES.SETTINGS);
+    }
+
+    /**
+    * Upserts a single Settings row by Key: updates it if present, appends a
+    * new row (with an empty Description) if not.
+    * @param {string} key
+    * @param {string} value
+    * @return {Object} The resulting Settings row.
+    */
+    function upsertSetting(key, value) {
+      if (AppUtils.isEmpty(key)) {
+        throw new Error('DashboardService.upsertSetting: "key" is required.');
+      }
+      const existing = SpreadsheetService.findRow(SHEET_NAMES.SETTINGS, SETTINGS_HEADERS.KEY, key);
+      if (existing) {
+        SpreadsheetService.updateRow(SHEET_NAMES.SETTINGS, existing.__row, { [SETTINGS_HEADERS.VALUE]: value });
+      } else {
+        SpreadsheetService.appendRow(SHEET_NAMES.SETTINGS, {
+          [SETTINGS_HEADERS.KEY]: key,
+          [SETTINGS_HEADERS.VALUE]: value,
+          [SETTINGS_HEADERS.DESCRIPTION]: ''
+        });
+      }
+      return SpreadsheetService.findRow(SHEET_NAMES.SETTINGS, SETTINGS_HEADERS.KEY, key);
+    }
+
+    return {
+      getStatusSummary: getStatusSummary,
+      getFacultyStatistics: getFacultyStatistics,
+      getCountryStats: getCountryStats,
+      getUniversities: getUniversities,
+      getFilterOptions: getFilterOptions,
+      getRecentBips: getRecentBips,
+      getUpcomingDeadlines: getUpcomingDeadlines,
+      getUpcomingReminders: getUpcomingReminders,
+      searchBips: searchBips,
+      getBipDetails: getBipDetails,
+      getDashboardOverview: getDashboardOverview,
+      invalidateOverviewCache: invalidateOverviewCache,
+      updateBipStatus: updateBipStatus,
+      getSettings: getSettings,
+      upsertSetting: upsertSetting
+    };
+
+  })();
+
+Utilities.gs
+
+  /**
+  * Utilities.gs
+  * ---------------------------------------------------------------------------
+  * Small, stateless helper functions with no dependency on any other
+  * service. Exposed as the global "AppUtils" namespace.
+  *
+  * NOTE ON NAMING: this namespace is deliberately called AppUtils rather
+  * than "Utilities" because Google Apps Script already exposes a built-in
+  * global service named Utilities (Utilities.formatDate, Utilities.getUuid,
+  * Utilities.base64Encode, etc). Re-using that identifier would shadow the
+  * built-in service everywhere in the project, so every custom helper below
+  * lives on AppUtils instead, and internally delegates to the real
+  * Utilities service where appropriate.
+  * ---------------------------------------------------------------------------
+  */
+
+  const AppUtils = (function () {
+
+    /**
+    * Formats a Date using the project timezone.
+    * @param {Date} date
+    * @param {string=} pattern Defaults to 'dd.MM.yyyy'.
+    * @return {string}
+    */
+    function formatDate(date, pattern) {
+      if (!(date instanceof Date) || isNaN(date.getTime())) {
+        throw new Error('AppUtils.formatDate: "date" must be a valid Date object.');
+      }
+      return Utilities.formatDate(date, Config.getTimezone(), pattern || 'dd.MM.yyyy');
+    }
+
+    /**
+    * Parses a date given in several common formats into a Date object.
+    * Accepts: 'dd.MM.yyyy', 'dd/MM/yyyy', 'yyyy-MM-dd', ISO 8601 strings,
+    * and native Date instances (returned as-is).
+    * @param {string|Date} value
+    * @return {Date|null} Parsed date, or null if it could not be parsed.
+    */
+    function parseDate(value) {
+      if (value instanceof Date) {
+        return isNaN(value.getTime()) ? null : value;
+      }
+      if (isEmpty(value)) return null;
+
+      const str = String(value).trim();
+
+      // yyyy-MM-dd or full ISO 8601
+      if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
+        const isoDate = new Date(str);
+        if (!isNaN(isoDate.getTime())) return isoDate;
+      }
+
+      // dd.MM.yyyy or dd/MM/yyyy
+      const dmy = str.match(/^(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})$/);
+      if (dmy) {
+        const day = parseInt(dmy[1], 10);
+        const month = parseInt(dmy[2], 10) - 1;
+        const year = parseInt(dmy[3], 10);
+        const parsed = new Date(year, month, day);
+        if (!isNaN(parsed.getTime())) return parsed;
+      }
+
+      // Last resort: let the JS engine try.
+      const fallback = new Date(str);
+      return isNaN(fallback.getTime()) ? null : fallback;
+    }
+
+    /**
+    * Generates a RFC4122-style UUID using the built-in Utilities service.
+    * @return {string}
+    */
+    function generateUUID() {
+      return Utilities.getUuid();
+    }
+
+    /**
+    * Returns true for null, undefined, empty string (after trim), empty
+    * array or empty object.
+    * @param {*} value
+    * @return {boolean}
+    */
+    function isEmpty(value) {
+      if (value === null || value === undefined) return true;
+      if (typeof value === 'string') return value.trim().length === 0;
+      if (Array.isArray(value)) return value.length === 0;
+      if (typeof value === 'object') return Object.keys(value).length === 0;
+      return false;
+    }
+
+    /**
+    * Escapes a string for safe injection into HTML markup.
+    * @param {string} str
+    * @return {string}
+    */
+    function escapeHtml(str) {
+      if (str === null || str === undefined) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    /**
+    * Deep-clones a JSON-serializable value.
+    * @param {*} value
+    * @return {*}
+    */
+    function deepClone(value) {
+      if (value === null || value === undefined) return value;
+      return JSON.parse(JSON.stringify(value));
+    }
+
+    /**
+    * Collapses internal whitespace/newlines and trims a string.
+    * @param {string} str
+    * @return {string}
+    */
+    function collapseWhitespace(str) {
+      if (isEmpty(str)) return '';
+      return String(str).replace(/\s+/g, ' ').trim();
+    }
+
+    /**
+    * Capitalizes the first letter of every word, leaving the rest of each
+    * word untouched (safe for diacritics and existing acronyms like "STU").
+    * @param {string} str
+    * @return {string}
+    */
+    function toTitleCase(str) {
+      if (isEmpty(str)) return '';
+      return String(str)
+        .trim()
+        .split(/\s+/)
+        .map(function (word) {
+          if (word === word.toUpperCase() && word.length <= 6) return word; // keep acronyms
+          return word.charAt(0).toUpperCase() + word.slice(1);
+        })
+        .join(' ');
+    }
+
+    /**
+    * Very small, dependency-free e-mail validator (format only; does not
+    * verify deliverability).
+    * @param {string} email
+    * @return {boolean}
+    */
+    function isValidEmail(email) {
+      if (isEmpty(email)) return false;
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email).trim());
+    }
+
+    /**
+    * Retries `fn` up to `maxAttempts` times with a fixed delay between
+    * attempts, re-throwing the last error if every attempt fails.
+    * @param {function():*} fn
+    * @param {number=} maxAttempts Defaults to 3.
+    * @param {number=} delayMs Defaults to 1000.
+    * @return {*}
+    */
+    function retry(fn, maxAttempts, delayMs) {
+      const attempts = maxAttempts || 3;
+      const wait = delayMs || 1000;
+      let lastError = null;
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+          return fn();
+        } catch (e) {
+          lastError = e;
+          log(LOG_LEVEL.WARN, 'AppUtils.retry', 'Attempt ' + attempt + '/' + attempts + ' failed.', e.message);
+          if (attempt < attempts) {
+            Utilities.sleep(wait);
+          }
+        }
+      }
+      throw lastError;
+    }
+
+    /**
+    * Writes a single row to the Logs sheet. Failures to log are swallowed
+    * (logging must never break the calling business logic) but are surfaced
+    * via Stackdriver/Apps Script logs through console.error as a fallback.
+    * @param {string} level One of LOG_LEVEL.
+    * @param {string} source Name of the calling file/function, e.g. "GmailService.importNew".
+    * @param {string} message Human-readable message.
+    * @param {*=} details Optional extra context (object, error message, etc).
+    */
+    function log(level, source, message, details) {
+      try {
+        const sheet = Config.getSpreadsheet().getSheetByName(SHEET_NAMES.LOGS);
+        if (!sheet) {
+          console.log('[' + level + '] ' + source + ': ' + message);
+          return;
+        }
+        const detailsStr = isEmpty(details)
+          ? ''
+          : (typeof details === 'string' ? details : JSON.stringify(details));
+        sheet.appendRow([new Date(), level, source, message, detailsStr]);
+      } catch (e) {
+        // Never let logging itself throw.
+        console.error('AppUtils.log failed: ' + e.message);
+      }
+    }
+
+    /**
+    * Splits an array into chunks of at most `size` elements. Useful for
+    * batching Gmail/Drive/Gemini calls to stay under quota bursts.
+    * @param {Array} array
+    * @param {number} size
+    * @return {Array<Array>}
+    */
+    function chunk(array, size) {
+      const result = [];
+      for (let i = 0; i < array.length; i += size) {
+        result.push(array.slice(i, i + size));
+      }
+      return result;
+    }
+
+    return {
+      formatDate: formatDate,
+      parseDate: parseDate,
+      generateUUID: generateUUID,
+      isEmpty: isEmpty,
+      escapeHtml: escapeHtml,
+      deepClone: deepClone,
+      collapseWhitespace: collapseWhitespace,
+      toTitleCase: toTitleCase,
+      isValidEmail: isValidEmail,
+      retry: retry,
+      log: log,
+      chunk: chunk
+    };
+
+  })();
+
+
+Constants.gs
+
+    /**
+  * Constants.gs
+  * ---------------------------------------------------------------------------
+  * Single source of truth for every string literal used across the BIP
+  * Management System: sheet names, header labels, status values, template
+  * names, cache/lock configuration, Gmail labels, Script Properties keys and
+  * router action names.
+  *
+  * RULE: no other file in this project may hardcode a sheet name, header
+  * label, status value, or configuration key. Everything is referenced from
+  * here so that renaming a column or a sheet only requires a change in one
+  * place.
+  * ---------------------------------------------------------------------------
+  */
+
+  /** Names of every sheet used by the application. */
+  const SHEET_NAMES = Object.freeze({
+    MAIN: 'Main',
+    FACULTY_COORDINATORS: 'Faculty Coordinators',
+    EMAIL_TEMPLATES: 'Email Templates',
+    SETTINGS: 'Settings',
+    LOGS: 'Logs',
+    METADATA: 'Metadata'
+  });
+
+  /** All sheet names as a flat array, useful for iteration during install. */
+  const ALL_SHEET_NAMES = Object.freeze(Object.values(SHEET_NAMES));
+
+  /**
+  * Logical field keys mapped to the exact ROW 2 header text of the Main
+  * sheet. The Main sheet has two header rows: row 1 holds merged visual
+  * category labels (not machine-readable) and row 2 holds the real column
+  * headers. SpreadsheetService builds a column map at runtime by matching
+  * these header strings against row 2, so physical column order may change
+  * without breaking the application. NEVER hardcode a column letter/number
+  * anywhere else in the project.
+  */
+  const MAIN_HEADERS = Object.freeze({
+    BIP: 'BIP',
+    UNIVERSITY: 'Univerzita',
+    LEVEL: 'Úroveň',
+    START_DATE: 'Začiatok',
+    END_DATE: 'Koniec',
+    DEADLINE: 'Deadline',
+    APPLICATION_METHOD: 'Spôsob prihlásenia',
+    REQUIREMENTS: 'Požiadavky',
+    FACULTY: 'Fakulta',
+    STUDENT_COUNT: 'Počet študentov',
+    STATUS: 'Stav',
+    DETAILS: 'Podrobnosti',
+    FILE: 'Súbor',
+    NOTES: 'Poznámky',
+    FACULTY_SVF: 'SvF',
+    FACULTY_SJF: 'SjF',
+    FACULTY_FEI: 'FEI',
+    FACULTY_FCHPT: 'FCHPT',
+    FACULTY_FAD: 'FAD',
+    FACULTY_MTF: 'MTF',
+    FACULTY_FIIT: 'FIIT'
+  });
+
+  /** Ordered list of the seven STU faculty columns on the Main sheet. */
+  const FACULTY_COLUMNS = Object.freeze([
+    MAIN_HEADERS.FACULTY_SVF,
+    MAIN_HEADERS.FACULTY_SJF,
+    MAIN_HEADERS.FACULTY_FEI,
+    MAIN_HEADERS.FACULTY_FCHPT,
+    MAIN_HEADERS.FACULTY_FAD,
+    MAIN_HEADERS.FACULTY_MTF,
+    MAIN_HEADERS.FACULTY_FIIT
+  ]);
+
+  /**
+  * Human-readable full names for each faculty code, used for fuzzy matching
+  * Gemini output (which may return a full faculty name instead of the short
+  * code) and for notification templates.
+  */
+  const FACULTY_FULL_NAMES = Object.freeze({
+    [MAIN_HEADERS.FACULTY_SVF]: 'Stavebná fakulta',
+    [MAIN_HEADERS.FACULTY_SJF]: 'Strojnícka fakulta',
+    [MAIN_HEADERS.FACULTY_FEI]: 'Fakulta elektrotechniky a informatiky',
+    [MAIN_HEADERS.FACULTY_FCHPT]: 'Fakulta chemickej a potravinárskej technológie',
+    [MAIN_HEADERS.FACULTY_FAD]: 'Fakulta architektúry a dizajnu',
+    [MAIN_HEADERS.FACULTY_MTF]: 'Materiálovotechnologická fakulta',
+    [MAIN_HEADERS.FACULTY_FIIT]: 'Fakulta informatiky a informačných technológií'
+  });
+
+  /** Mark written into a faculty column when that faculty is invited. */
+  const FACULTY_INVITED_MARK = 'X';
+
+  const FACULTY_COORDINATORS_HEADERS = Object.freeze({
+    FACULTY: 'Faculty',
+    FULL_NAME: 'Full Name',
+    EMAIL: 'Email'
+  });
+
+  const EMAIL_TEMPLATES_HEADERS = Object.freeze({
+    TEMPLATE: 'Template',
+    SUBJECT: 'Subject',
+    BODY: 'Body'
+  });
+
+  const METADATA_HEADERS = Object.freeze({
+    MESSAGE_ID: 'Message ID',
+    THREAD_ID: 'Thread ID',
+    MAIN_ROW_NUMBER: 'Main Row Number',
+    GMAIL_URL: 'Gmail URL',
+    DRIVE_FOLDER_URL: 'Drive Folder URL',
+    IMPORTED_AT: 'Imported At',
+    UPDATED_AT: 'Updated At',
+    REMINDER_COUNT: 'Reminder Count'
+  });
+
+  const SETTINGS_HEADERS = Object.freeze({
+    KEY: 'Key',
+    VALUE: 'Value',
+    DESCRIPTION: 'Description'
+  });
+
+  const LOGS_HEADERS = Object.freeze({
+    TIMESTAMP: 'Timestamp',
+    LEVEL: 'Level',
+    SOURCE: 'Source',
+    MESSAGE: 'Message',
+    DETAILS: 'Details'
+  });
+
+  /**
+  * Whitelisted status values for the "Stav" column on the Main sheet.
+  * Keeping this as an explicit list lets Installer.gs build a dropdown
+  * (data validation) and lets ReminderService decide which rows are still
+  * eligible for a reminder.
+  */
+  const BIP_STATUS = Object.freeze({
+    NEW: 'Nové',
+    AWAITING_RESPONSE: 'Čaká na odpoveď',
+    CONFIRMED: 'Potvrdené',
+    DECLINED: 'Zamietnuté',
+    EXPIRED: 'Po termíne',
+    CLOSED: 'Uzavreté'
+  });
+
+  const BIP_STATUS_VALUES = Object.freeze(Object.values(BIP_STATUS));
+
+  /** Statuses for which ReminderService will still send reminders. */
+  const REMINDABLE_STATUSES = Object.freeze([
+    BIP_STATUS.NEW,
+    BIP_STATUS.AWAITING_RESPONSE
+  ]);
+
+  /** Row names inside the Email Templates sheet. */
+  const TEMPLATE_NAMES = Object.freeze({
+    NEW_BIP: 'NEW_BIP',
+    REMINDER: 'REMINDER'
+  });
+
+  /** Log severity levels used by Utilities.log and the Logs sheet. */
+  const LOG_LEVEL = Object.freeze({
+    INFO: 'INFO',
+    WARN: 'WARN',
+    ERROR: 'ERROR',
+    DEBUG: 'DEBUG'
+  });
+
+  /** Gmail label that new BIP invitation e-mails are filtered into. */
+  const GMAIL_LABEL_NEW_BIPS = 'new-bips-2026-2027';
+
+  /** Gmail label applied once a message has been fully processed. */
+  const GMAIL_LABEL_PROCESSED = 'new-bips-2026-2027/processed';
+
+  /** Script Properties keys (never hardcode a secret directly in code). */
+  const SCRIPT_PROPERTY_KEYS = Object.freeze({
+    GEMINI_API_KEY: 'GEMINI_API_KEY',
+    ROOT_DRIVE_FOLDER_ID: 'ROOT_DRIVE_FOLDER_ID',
+    TIMEZONE: 'TIMEZONE'
+  });
+
+  /** Default IANA timezone used if the TIMEZONE script property is unset. */
+  const DEFAULT_TIMEZONE = 'Europe/Bratislava';
+
+  /** CacheService key prefixes. */
+  const CACHE_KEYS = Object.freeze({
+    COLUMN_MAP_PREFIX: 'colmap_',
+    DASHBOARD_STATS: 'dashboard_stats'
+  });
+
+  /** CacheService TTLs, in seconds (CacheService max is 21600 = 6 hours). */
+  const CACHE_TTL_SECONDS = Object.freeze({
+    COLUMN_MAP: 21600,
+    DASHBOARD_STATS: 300
+  });
+
+  /** LockService default wait time, in milliseconds. */
+  const LOCK_WAIT_MS = 30000;
+
+  /** Router action names understood by doGet / doPost in WebApp.gs. */
+  const ROUTER_ACTIONS = Object.freeze({
+    GET_DASHBOARD_STATS: 'getDashboardStats',
+    GET_BIPS: 'getBips',
+    GET_BIP: 'getBip',
+    UPDATE_BIP_STATUS: 'updateBipStatus',
+    GET_FACULTIES: 'getFaculties',
+    GET_COORDINATORS: 'getCoordinators'
+  });
+
+  /** Gemini model + endpoint configuration. */
+  const GEMINI_CONFIG = Object.freeze({
+    MODEL: 'gemini-2.5-pro',
+    API_BASE_URL: 'https://generativelanguage.googleapis.com/v1beta/models/',
+    MAX_RETRIES: 3,
+    RETRY_DELAY_MS: 1500
+  });
+
+  /** Number of days between automatic reminder emails. */
+  const REMINDER_INTERVAL_DAYS = 3;
+
+  /** 1-based row number that contains the real headers on the Main sheet. */
+  const MAIN_HEADER_ROW = 2;
+
+  /** 1-based row number that contains the real headers on single-header sheets. */
+  const DEFAULT_HEADER_ROW = 1;
+
+  /** Number of frozen rows on the Main sheet (category row + header row). */
+  const MAIN_FROZEN_ROWS = 2;
+
+  /** Number of frozen rows on every single-header sheet. */
+  const DEFAULT_FROZEN_ROWS = 1;
+
+  /** Trigger handler function names installed by Installer.gs / TriggerService.gs. */
+  const TRIGGER_HANDLERS = Object.freeze({
+    IMPORT_GMAIL_BIPS: 'importGmailBips',
+    SEND_REMINDERS: 'sendReminders',
+    UPDATE_DEADLINES: 'updateDeadlines'
+  });
+
+  /**
+  * Name of the season folder created under the project's root Drive folder
+  * (Config.getRootDriveFolderId()), inside which one subfolder per imported
+  * BIP is created by DriveService.getOrCreateBipFolder(). Bumped once a year
+  * when the office starts tracking a new academic season's BIPs.
+  */
+  const DRIVE_BIP_SEASON_FOLDER_NAME = 'BIP 2026-2027';
+
+
+
+📁 Frontend
+
+index.html

@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!-- Viewport meta tag is injected server-side by WebApp.gs (doGet -> .addMetaTag('viewport', ...)); not duplicated here. -->
+  <title>BIP Management System - STU</title>
+  <base target="_top">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <!-- Stylesheet.html — the uploaded style.css contents, included verbatim, not duplicated here. -->
+  <?!= include('Stylesheet'); ?>
+</head>
+<body>
+
+  <div class="shell">
+
+    <!-- ============================== SIDEBAR ============================== -->
+    <aside class="sidebar" aria-label="Primary">
+      <div class="brand">
+        <span class="mark">BIP</span>
+        <div>
+          <span class="name">BIP Management</span>
+          <span class="sub">International Relations Office · STU</span>
+        </div>
+      </div>
+
+      <nav aria-label="Main navigation" style="display:flex;flex-direction:column;gap:4px;">
+        <a class="nav-link active" data-view="dashboard" href="#/dashboard">
+          <span class="dot"></span>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect></svg>
+          Dashboard
+        </a>
+        <a class="nav-link" data-view="search" href="#/search">
+          <span class="dot"></span>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="6.5"></circle><line x1="20" y1="20" x2="15.5" y2="15.5"></line></svg>
+          Search BIPs
+        </a>
+        <a class="nav-link" data-view="reminders" href="#/reminders">
+          <span class="dot"></span>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9a6 6 0 0 1 12 0c0 3.2 1 5 2 6H4c1-1 2-2.8 2-6Z"></path><path d="M9.5 19a2.5 2.5 0 0 0 5 0"></path></svg>
+          Reminders
+        </a>
+        <a class="nav-link" data-view="settings" href="#/settings">
+          <span class="dot"></span>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"></circle><path d="M12 3v2.4M12 18.6V21M4.9 6.9l1.7 1.7M17.4 15.4l1.7 1.7M3 12h2.4M18.6 12H21M4.9 17.1l1.7-1.7M17.4 8.6l1.7-1.7"></path></svg>
+          Settings
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="health-pill" id="health-pill">
+          <span class="led"></span>
+          <span id="health-text">Connecting&hellip;</span>
+        </div>
+        <div style="margin-top:10px;">
+          <a href="<?= scriptUrl ?>" target="_blank" rel="noopener" style="color:#8FA0B3;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:5px;">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3"></path><path d="M14 4h6v6"></path><path d="M20 4 10 14"></path></svg>
+            Open in new tab
+          </a>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ============================== MAIN ============================== -->
+    <main class="main">
+
+      <!-- Persistent top navigation (static chrome; per-view titles render inside #view via .view-title-row) -->
+      <header class="topbar">
+        <div>
+          <h1>BIP Management System</h1>
+          <div class="lede">Erasmus+ Blended Intensive Programmes &mdash; International Relations Office, STU</div>
+        </div>
+        <div class="topbar-actions">
+          <div style="position:relative;">
+            <button class="btn btn-ghost" id="btn-notifications" type="button" style="position:relative;" aria-haspopup="true" aria-expanded="false" aria-controls="notifications-panel" title="Notifications">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9a6 6 0 0 1 12 0c0 3.2 1 5 2 6H4c1-1 2-2.8 2-6Z"></path><path d="M9.5 19a2.5 2.5 0 0 0 5 0"></path></svg>
+              <span id="notifications-badge" style="display:none;position:absolute;top:3px;right:3px;background:var(--bad);color:#fff;font-size:10px;font-weight:700;line-height:1;min-width:15px;height:15px;border-radius:999px;align-items:center;justify-content:center;padding:0 3px;">0</span>
+            </button>
+
+            <div class="panel" id="notifications-panel" style="display:none;position:absolute;top:calc(100% + 8px);right:0;width:320px;margin-bottom:0;box-shadow:var(--shadow);z-index:50;" role="dialog" aria-label="Notifications">
+              <div class="panel-head">
+                <h2>Notifications</h2>
+                <span class="hint" id="notifications-count-label">0 new</span>
+              </div>
+              <div class="row-list" id="notifications-list">
+                <div class="empty-state" id="notifications-empty">You&rsquo;re all caught up &mdash; no new notifications.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <!-- Router.render() (script.js) swaps Views.dashboard / Views.search / Views.reminders / Views.settings in and out of this node -->
+      <div id="view"></div>
+
+    </main>
+  </div>
+
+  <!-- ============================== DRAWER (BIP detail) ============================== -->
+  <div class="drawer-overlay" id="drawer-overlay"></div>
+  <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+    <div class="drawer-head">
+      <div>
+        <h3 id="drawer-title">&mdash;</h3>
+        <div class="drawer-sub" id="drawer-sub">&mdash;</div>
+      </div>
+      <button class="drawer-close" id="drawer-close" type="button" aria-label="Close panel">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="5" x2="19" y2="19"></line><line x1="19" y1="5" x2="5" y2="19"></line></svg>
+      </button>
+    </div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+
+  <!-- ============================== MODAL CONTAINER (future: confirmations / forms) ============================== -->
+  <div class="modal-overlay" id="modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(22,32,43,.35);align-items:center;justify-content:center;z-index:55;">
+    <div class="modal" id="modal-container" role="dialog" aria-modal="true" aria-labelledby="modal-title" style="background:var(--surface);border-radius:var(--radius);width:min(440px,90vw);max-height:85vh;overflow:auto;box-shadow:var(--shadow);">
+      <div class="panel-head">
+        <h2 id="modal-title">Confirm action</h2>
+        <button class="drawer-close" id="modal-close" type="button" aria-label="Close">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="5" x2="19" y2="19"></line><line x1="19" y1="5" x2="5" y2="19"></line></svg>
+        </button>
+      </div>
+      <div class="panel-body padded" id="modal-body">
+        <p style="margin:0;font-size:13px;color:var(--ink-soft);line-height:1.6;">Are you sure you want to continue? This action cannot be undone.</p>
+      </div>
+      <div class="panel-body padded" id="modal-footer" style="display:flex;justify-content:flex-end;gap:10px;border-top:1px solid var(--border);">
+        <button class="btn btn-ghost" id="modal-cancel" type="button">Cancel</button>
+        <button class="btn btn-primary" id="modal-confirm" type="button"><span class="spinner"></span><span class="btn-label">Confirm</span></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================== LOADING OVERLAY (future: initial boot / long operations) ============================== -->
+  <div class="loading-overlay" id="loading-overlay" role="status" aria-live="polite" aria-label="Loading" style="display:none;position:fixed;inset:0;background:var(--bg);align-items:center;justify-content:center;flex-direction:column;gap:14px;z-index:80;">
+    <div class="spinner" id="loading-spinner" style="width:34px;height:34px;border-width:3px;border-color:var(--border);border-top-color:var(--accent);"></div>
+    <div id="loading-text" style="font-size:13px;color:var(--ink-soft);font-weight:500;">Loading BIP Management System&hellip;</div>
+  </div>
+
+  <!-- ============================== TOASTS ============================== -->
+  <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="true"></div>
+
+  <!-- JavaScript.html — the uploaded script.js contents, included verbatim, not duplicated here. -->
+  <?!= include('JavaScript'); ?>
+</body>
+</html>
