@@ -4,14 +4,13 @@
   <meta charset="UTF-8">
   <!-- Viewport meta tag is injected server-side by WebApp.gs (doGet -> .addMetaTag('viewport', ...)); not duplicated here. -->
   <title>BIP Management System - STU</title>
-  <base target="_top">
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 
   <!-- Stylesheet.html — the uploaded style.css contents, included verbatim, not duplicated here. -->
-  <?!= include('Stylesheet'); ?>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
@@ -54,12 +53,6 @@
         <div class="health-pill" id="health-pill">
           <span class="led"></span>
           <span id="health-text">Connecting&hellip;</span>
-        </div>
-        <div style="margin-top:10px;">
-          <a href="<?= scriptUrl ?>" target="_blank" rel="noopener" style="color:#8FA0B3;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:5px;">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3"></path><path d="M14 4h6v6"></path><path d="M20 4 10 14"></path></svg>
-            Open in new tab
-          </a>
         </div>
       </div>
     </aside>
@@ -143,6 +136,6 @@
   <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="true"></div>
 
   <!-- JavaScript.html — the uploaded script.js contents, included verbatim, not duplicated here. -->
-  <?!= include('JavaScript'); ?>
+  <script src="script.js"></script>
 </body>
 </html>

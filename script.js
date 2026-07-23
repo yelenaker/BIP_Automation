@@ -1,4 +1,3 @@
-<script>
 (function () {
   'use strict';
 
@@ -7,18 +6,47 @@
   // in Promises so the rest of the app can use async/await.
   // =====================================================================
 
-  function callApi(mode, action, params) {
-    return new Promise(function (resolve, reject) {
-      const runner = google.script.run
-        .withSuccessHandler(resolve)
-        .withFailureHandler(function (err) { reject(new Error(err && err.message ? err.message : String(err))); });
-      if (mode === 'post') {
-        runner.apiPost(action, params || {});
-      } else {
-        runner.apiGet(action, params || {});
-      }
-    });
-  }
+    const API_URL =
+    "https://script.google.com/macros/s/AKfycbze7C7WxxlUDtvvTTBICTRUcWIHSfj5lyIS2zYrPbCjJxWrq_997a9v8SEaWrG49vXF/exec";
+
+    async function callApi(mode, action, params = {}) {
+
+        let url = API_URL;
+
+        if (mode === "get") {
+
+            const query = new URLSearchParams({
+                action,
+                ...params
+            });
+
+            const response = await fetch(url + "?" + query);
+
+            return await response.json();
+
+        }
+
+        const response = await fetch(url, {
+
+            method: "POST",
+
+            headers: {
+                "Content-Type":"application/json"
+            },
+
+            body: JSON.stringify({
+
+                action,
+
+                params
+
+            })
+
+        });
+
+        return await response.json();
+
+    }
 
   const Api = {
     dashboard: function (refresh) { return callApi('get', 'dashboard', { refresh: refresh ? 'true' : 'false' }); },
@@ -772,4 +800,3 @@
     setInterval(pollHealth, 60000);
   });
 })();
-</script>
