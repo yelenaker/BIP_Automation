@@ -11,41 +11,20 @@
 
     async function callApi(mode, action, params = {}) {
 
-        let url = API_URL;
-
-        if (mode === "get") {
-
-            const query = new URLSearchParams({
-                action,
-                ...params
-            });
-
-            const response = await fetch(url + "?" + query);
-
-            return await response.json();
-
-        }
-
-        const response = await fetch(url, {
-
-            method: "POST",
-
-            headers: {
-                "Content-Type":"application/json"
-            },
-
-            body: JSON.stringify({
-
-                action,
-
-                params
-
-            })
-
+        const query = new URLSearchParams({
+            action,
+            ...params
         });
 
-        return await response.json();
+        const response = await fetch(API_URL + "?" + query);
 
+        const json = await response.json();
+
+        if (!json.success) {
+            throw new Error(json.error || "Unknown error");
+        }
+
+        return json.data;
     }
 
   const Api = {
@@ -56,10 +35,27 @@
     reminders: function () { return callApi('get', 'reminders', {}); },
     settings: function () { return callApi('get', 'settings', {}); },
     health: function () { return callApi('get', 'health', {}); },
-    updateStatus: function (rowNumber, status) { return callApi('post', 'updateStatus', { rowNumber: rowNumber, status: status }); },
-    triggerImport: function () { return callApi('post', 'import', {}); },
-    sendReminders: function () { return callApi('post', 'reminders', {}); },
-    upsertSetting: function (key, value) { return callApi('post', 'settings', { key: key, value: value }); }
+    updateStatus: function (rowNumber, status) {
+        return callApi('get', 'updateStatus', {
+            rowNumber,
+            status
+        });
+    },
+
+    triggerImport: function () {
+        return callApi('get', 'import', {});
+    },
+
+    sendReminders: function () {
+        return callApi('get', 'sendReminders', {});
+    },
+
+    upsertSetting: function (key, value) {
+        return callApi('get', 'saveSetting', {
+            key,
+            value
+        });
+    }
   };
 
   // =====================================================================
