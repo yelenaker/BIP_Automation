@@ -522,15 +522,20 @@
   "use strict";
 
   /* ------------------------------------------------------------------
-   * API layer — talks to the existing Router (Router.gs) through this
-   * page's own deployed Web App URL. No mock data, no invented
-   * endpoints: only the actions Router.gs already exposes are called
-   * (statistics, settings, import, sendReminder, testGemini).
+   * API layer — talks to the existing Router (Router.gs) running as a
+   * deployed Google Apps Script Web App. This page itself is served
+   * from GitHub Pages (a static host that cannot execute Router.gs),
+   * so the API endpoint must NEVER be derived from window.location —
+   * it must always be this fixed GAS_WEBAPP_URL. No mock data, no
+   * invented endpoints: only the actions Router.gs already exposes are
+   * called (statistics, settings, import, sendReminder, testGemini).
+   *
+   * If this Web App is ever redeployed under a new URL, update the
+   * value below (and only here).
    * ---------------------------------------------------------------- */
-  var API_BASE = (function(){
-    var url = new URL(window.location.href);
-    return url.origin + url.pathname;
-  })();
+  var GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbwjlTp0sKKtAd49gDGjPEcSNQgD7MJet--aFaqrQH47RI0b-V6Chp2_6Vut7vo7kD_aCg/exec";
+
+  var API_BASE = GAS_WEBAPP_URL;
 
   function apiUrl(action){
     return API_BASE + "?action=" + encodeURIComponent(action);
