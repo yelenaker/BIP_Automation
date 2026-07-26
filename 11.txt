@@ -1,0 +1,3 @@
+  function getMainSheet_() {
+    return getSheetByName_(SHEETS.MAIN);
+  }

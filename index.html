@@ -1,141 +1,973 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <!-- Viewport meta tag is injected server-side by WebApp.gs (doGet -> .addMetaTag('viewport', ...)); not duplicated here. -->
-  <title>BIP Management System - STU</title>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BIP Automation — Control Center</title>
+<style>
+  :root{
+    --surface-0:#F5F7FB;
+    --surface-1:#FFFFFF;
+    --surface-2:#FBFCFE;
+    --line:#E3E8F0;
+    --line-soft:#EEF1F6;
+    --ink-900:#0B1524;
+    --ink-700:#37455C;
+    --ink-500:#5B6B85;
+    --ink-400:#8A98AE;
+    --navy:#142A4F;
+    --navy-600:#1E3D6E;
+    --blue:#2F6FED;
+    --blue-soft:#EAF1FE;
+    --green:#137A5B;
+    --green-soft:#E4F6EF;
+    --orange:#B5650B;
+    --orange-soft:#FCF1DE;
+    --red:#C4303E;
+    --red-soft:#FCEAEC;
+    --radius-lg:16px;
+    --radius-md:12px;
+    --radius-sm:8px;
+    --shadow-sm:0 1px 2px rgba(11,21,36,0.05), 0 1px 1px rgba(11,21,36,0.03);
+    --shadow-md:0 12px 28px -12px rgba(11,21,36,0.16), 0 2px 8px -2px rgba(11,21,36,0.06);
+    --font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI","Inter",Roboto,Helvetica,Arial,sans-serif;
+    --font-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *,*::before,*::after{ box-sizing:border-box; }
+  html,body{ margin:0; padding:0; }
+  body{
+    font-family:var(--font-ui);
+    background:var(--surface-0);
+    color:var(--ink-700);
+    -webkit-font-smoothing:antialiased;
+    line-height:1.45;
+  }
+  h1,h2,h3,h4{ margin:0; color:var(--ink-900); letter-spacing:-0.01em; }
+  a{ color:var(--blue); text-decoration:none; }
+  a:hover{ text-decoration:underline; }
+  button{ font-family:inherit; }
+  input,select,textarea{ font-family:inherit; }
 
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  /* ---------- Top bar ---------- */
+  .topbar{
+    position:sticky; top:0; z-index:20;
+    background:rgba(255,255,255,0.86);
+    backdrop-filter:saturate(180%) blur(10px);
+    border-bottom:1px solid var(--line);
+  }
+  .topbar-inner{
+    max-width:1280px; margin:0 auto;
+    padding:12px 28px;
+    display:flex; align-items:center; gap:24px;
+  }
+  .brand{ display:flex; align-items:center; gap:10px; flex:0 0 auto; }
+  .brand-mark{
+    width:32px; height:32px; border-radius:9px;
+    background:linear-gradient(155deg, var(--navy), var(--blue));
+    position:relative; flex:0 0 auto;
+  }
+  .brand-mark::after{
+    content:""; position:absolute; inset:9px;
+    border:2px solid rgba(255,255,255,0.9); border-radius:4px;
+  }
+  .brand-text{ display:flex; flex-direction:column; line-height:1.15; }
+  .brand-title{ font-size:15px; font-weight:700; color:var(--ink-900); }
+  .brand-sub{ font-size:11px; color:var(--ink-400); font-weight:600; letter-spacing:.02em; }
 
-  <!-- Stylesheet.html — the uploaded style.css contents, included verbatim, not duplicated here. -->
-  <link rel="stylesheet" href="style.css">
+  .pipeline{
+    display:flex; align-items:center; gap:0;
+    flex:1 1 auto; justify-content:center;
+    min-width:0;
+  }
+  .pipeline-track{
+    display:flex; align-items:center; gap:0;
+    padding:6px 14px; border-radius:999px;
+    background:var(--surface-2); border:1px solid var(--line-soft);
+  }
+  .pipe-node{
+    display:flex; align-items:center; gap:6px;
+    font-size:11.5px; font-weight:600; color:var(--ink-500);
+    padding:0 10px; white-space:nowrap;
+  }
+  .pipe-dot{ width:6px; height:6px; border-radius:50%; background:var(--ink-400); flex:0 0 auto; }
+  .pipe-node.is-active .pipe-dot{ background:var(--green); }
+  .pipe-link{
+    width:26px; height:2px; position:relative; overflow:hidden;
+    background:var(--line); border-radius:2px; flex:0 0 auto;
+  }
+  .pipe-link::after{
+    content:""; position:absolute; inset:0; width:40%;
+    background:linear-gradient(90deg, transparent, var(--blue), transparent);
+    animation:flow 2.6s linear infinite;
+  }
+  @keyframes flow{
+    0%{ transform:translateX(-120%); }
+    100%{ transform:translateX(340%); }
+  }
+
+  .topbar-right{ display:flex; align-items:center; gap:16px; flex:0 0 auto; }
+  .clock{ font-family:var(--font-mono); font-size:12.5px; color:var(--ink-500); font-variant-numeric:tabular-nums; }
+  .conn-status{
+    display:flex; align-items:center; gap:6px;
+    font-size:12px; font-weight:600; padding:5px 10px; border-radius:999px;
+    background:var(--green-soft); color:var(--green);
+  }
+  .conn-status.is-error{ background:var(--red-soft); color:var(--red); }
+  .conn-status.is-loading{ background:var(--surface-2); color:var(--ink-400); }
+  .conn-dot{ width:6px; height:6px; border-radius:50%; background:currentColor; }
+
+  /* ---------- Layout ---------- */
+  .shell{ max-width:1280px; margin:0 auto; padding:28px; }
+  .overview{
+    display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:22px;
+  }
+  .stat-card{
+    background:var(--surface-1); border:1px solid var(--line);
+    border-radius:var(--radius-lg); padding:18px 20px;
+    box-shadow:var(--shadow-sm);
+  }
+  .stat-label{ font-size:12px; color:var(--ink-400); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  .stat-value{ font-size:28px; font-weight:700; color:var(--ink-900); margin-top:6px; font-variant-numeric:tabular-nums; }
+  .stat-foot{ font-size:12px; color:var(--ink-500); margin-top:4px; }
+  .stat-foot a{ font-weight:600; }
+
+  .columns{ display:grid; grid-template-columns:1.62fr 1fr; gap:18px; align-items:start; }
+  .col{ display:flex; flex-direction:column; gap:18px; min-width:0; }
+
+  .card{
+    background:var(--surface-1); border:1px solid var(--line);
+    border-radius:var(--radius-lg); box-shadow:var(--shadow-sm);
+    overflow:hidden;
+  }
+  .card-head{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:16px 20px; border-bottom:1px solid var(--line-soft);
+  }
+  .card-title{ font-size:14.5px; font-weight:700; }
+  .card-desc{ font-size:12px; color:var(--ink-400); margin-top:2px; }
+  .card-body{ padding:18px 20px; }
+  .card-body + .card-body{ border-top:1px solid var(--line-soft); }
+
+  /* ---------- Buttons ---------- */
+  .btn{
+    display:inline-flex; align-items:center; justify-content:center; gap:8px;
+    border-radius:var(--radius-sm); border:1px solid transparent;
+    font-size:13px; font-weight:600; padding:9px 14px; cursor:pointer;
+    transition:transform .12s ease, box-shadow .12s ease, background .12s ease, border-color .12s ease;
+    white-space:nowrap;
+  }
+  .btn:active{ transform:translateY(1px); }
+  .btn:disabled{ opacity:.55; cursor:not-allowed; transform:none; }
+  .btn-primary{ background:var(--navy); color:#fff; }
+  .btn-primary:hover:not(:disabled){ background:var(--navy-600); }
+  .btn-accent{ background:var(--blue); color:#fff; }
+  .btn-accent:hover:not(:disabled){ box-shadow:0 4px 14px -4px rgba(47,111,237,.55); }
+  .btn-ghost{ background:var(--surface-2); color:var(--ink-700); border-color:var(--line); }
+  .btn-ghost:hover:not(:disabled){ background:#fff; border-color:var(--ink-400); }
+  .btn-sm{ padding:6px 10px; font-size:12px; }
+  .btn-block{ width:100%; }
+  .spinner{
+    width:13px; height:13px; border-radius:50%;
+    border:2px solid rgba(255,255,255,0.4); border-top-color:#fff;
+    animation:spin .7s linear infinite; flex:0 0 auto;
+  }
+  .btn-ghost .spinner{ border-color:rgba(20,42,79,0.18); border-top-color:var(--navy); }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+
+  /* ---------- Form elements ---------- */
+  .field{ margin-bottom:14px; }
+  .field:last-child{ margin-bottom:0; }
+  .field-label{ display:block; font-size:12.5px; font-weight:600; color:var(--ink-700); margin-bottom:5px; }
+  .field-help{ font-size:11.5px; color:var(--ink-400); margin-top:5px; }
+  .input, .select, .textarea{
+    width:100%; border:1px solid var(--line); border-radius:var(--radius-sm);
+    padding:9px 11px; font-size:13px; color:var(--ink-900); background:var(--surface-2);
+    outline:none; transition:border-color .12s ease, background .12s ease;
+  }
+  .input:focus, .select:focus, .textarea:focus{ border-color:var(--blue); background:#fff; }
+  .input.is-mono{ font-family:var(--font-mono); font-size:12.5px; }
+  .textarea{ resize:vertical; min-height:56px; }
+  .row-2{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+
+  .pill-group{ display:flex; flex-wrap:wrap; gap:8px; }
+  .pill-radio{ position:relative; }
+  .pill-radio input{ position:absolute; opacity:0; inset:0; cursor:pointer; }
+  .pill-radio span{
+    display:inline-flex; align-items:center; justify-content:center;
+    min-width:44px; padding:7px 10px; border-radius:999px; border:1px solid var(--line);
+    font-size:12.5px; font-weight:600; color:var(--ink-500); background:var(--surface-2);
+    transition:all .12s ease;
+  }
+  .pill-radio input:checked + span{ background:var(--navy); border-color:var(--navy); color:#fff; }
+  .pill-radio:hover span{ border-color:var(--ink-400); }
+
+  .badge{
+    display:inline-flex; align-items:center; gap:5px;
+    font-size:11px; font-weight:700; padding:3px 9px; border-radius:999px;
+    text-transform:uppercase; letter-spacing:.03em;
+  }
+  .badge-ok{ background:var(--green-soft); color:var(--green); }
+  .badge-warn{ background:var(--orange-soft); color:var(--orange); }
+  .badge-error{ background:var(--red-soft); color:var(--red); }
+  .badge-neutral{ background:var(--surface-2); color:var(--ink-400); border:1px solid var(--line); }
+
+  .health-row{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:9px 0; border-bottom:1px solid var(--line-soft);
+  }
+  .health-row:last-child{ border-bottom:none; }
+  .health-label{ font-size:13px; font-weight:600; color:var(--ink-700); }
+  .health-sub{ font-size:11.5px; color:var(--ink-400); font-family:var(--font-mono); }
+
+  .action-grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .action-result{
+    margin-top:12px; padding:10px 12px; border-radius:var(--radius-sm);
+    font-size:12.5px; display:none; border:1px solid transparent;
+  }
+  .action-result.show{ display:block; }
+  .action-result.ok{ background:var(--green-soft); color:var(--green); border-color:rgba(19,122,91,.18); }
+  .action-result.err{ background:var(--red-soft); color:var(--red); border-color:rgba(196,48,62,.18); }
+
+  .bar-group{ margin-bottom:16px; }
+  .bar-group:last-child{ margin-bottom:0; }
+  .bar-group-title{ font-size:11.5px; font-weight:700; color:var(--ink-400); text-transform:uppercase; letter-spacing:.04em; margin-bottom:10px; }
+  .bar-row{ display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+  .bar-row:last-child{ margin-bottom:0; }
+  .bar-name{ width:112px; flex:0 0 auto; font-size:12.5px; color:var(--ink-700); font-weight:600; }
+  .bar-track{ flex:1 1 auto; height:8px; background:var(--surface-2); border-radius:6px; overflow:hidden; }
+  .bar-fill{ height:100%; border-radius:6px; background:var(--blue); transition:width .4s ease; }
+  .bar-count{ width:28px; flex:0 0 auto; text-align:right; font-size:12.5px; font-weight:700; color:var(--ink-900); font-variant-numeric:tabular-nums; }
+
+  .log-list{ display:flex; flex-direction:column-reverse; gap:0; max-height:280px; overflow-y:auto; }
+  .log-empty{ font-size:12.5px; color:var(--ink-400); padding:6px 0; }
+  .log-row{ display:flex; gap:10px; padding:9px 0; border-top:1px solid var(--line-soft); }
+  .log-row:last-child{ border-top:none; }
+  .log-dot{ width:7px; height:7px; border-radius:50%; margin-top:5px; flex:0 0 auto; background:var(--ink-400); }
+  .log-row.info .log-dot{ background:var(--blue); }
+  .log-row.ok .log-dot{ background:var(--green); }
+  .log-row.err .log-dot{ background:var(--red); }
+  .log-text{ font-size:12.5px; color:var(--ink-700); }
+  .log-time{ font-size:11px; color:var(--ink-400); font-family:var(--font-mono); margin-top:2px; }
+
+  .footer{
+    max-width:1280px; margin:0 auto; padding:20px 28px 40px;
+    display:flex; flex-wrap:wrap; gap:6px 18px; align-items:center;
+    font-size:12px; color:var(--ink-400);
+  }
+  .footer strong{ color:var(--ink-500); }
+  .footer-sep{ color:var(--line); }
+
+  .skeleton{ background:linear-gradient(90deg, var(--line-soft) 25%, var(--surface-0) 37%, var(--line-soft) 63%); background-size:400% 100%; animation:shimmer 1.4s ease infinite; border-radius:6px; color:transparent !important; }
+  @keyframes shimmer{ 0%{background-position:100% 50%;} 100%{background-position:0 50%;} }
+
+  @media (prefers-reduced-motion: reduce){
+    .pipe-link::after{ animation:none; }
+    .spinner{ animation:none; }
+    .skeleton{ animation:none; }
+  }
+
+  @media (max-width:980px){
+    .overview{ grid-template-columns:repeat(2,1fr); }
+    .columns{ grid-template-columns:1fr; }
+    .pipeline{ display:none; }
+    .action-grid{ grid-template-columns:1fr 1fr; }
+  }
+  @media (max-width:560px){
+    .overview{ grid-template-columns:1fr; }
+    .row-2{ grid-template-columns:1fr; }
+    .action-grid{ grid-template-columns:1fr; }
+    .topbar-inner{ padding:12px 16px; }
+    .shell{ padding:18px 16px; }
+  }
+</style>
 </head>
 <body>
 
-  <div class="shell">
-
-    <!-- ============================== SIDEBAR ============================== -->
-    <aside class="sidebar" aria-label="Primary">
+  <header class="topbar">
+    <div class="topbar-inner">
       <div class="brand">
-        <span class="mark">BIP</span>
-        <div>
-          <span class="name">BIP Management</span>
-          <span class="sub">International Relations Office · STU</span>
+        <div class="brand-mark"></div>
+        <div class="brand-text">
+          <span class="brand-title" id="appTitle">BIP Automation</span>
+          <span class="brand-sub" id="appVersion">v—</span>
         </div>
       </div>
 
-      <nav aria-label="Main navigation" style="display:flex;flex-direction:column;gap:4px;">
-        <a class="nav-link active" data-view="dashboard" href="#/dashboard">
-          <span class="dot"></span>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect></svg>
-          Dashboard
-        </a>
-        <a class="nav-link" data-view="search" href="#/search">
-          <span class="dot"></span>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="6.5"></circle><line x1="20" y1="20" x2="15.5" y2="15.5"></line></svg>
-          Search BIPs
-        </a>
-        <a class="nav-link" data-view="reminders" href="#/reminders">
-          <span class="dot"></span>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9a6 6 0 0 1 12 0c0 3.2 1 5 2 6H4c1-1 2-2.8 2-6Z"></path><path d="M9.5 19a2.5 2.5 0 0 0 5 0"></path></svg>
-          Reminders
-        </a>
-        <a class="nav-link" data-view="settings" href="#/settings">
-          <span class="dot"></span>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"></circle><path d="M12 3v2.4M12 18.6V21M4.9 6.9l1.7 1.7M17.4 15.4l1.7 1.7M3 12h2.4M18.6 12H21M4.9 17.1l1.7-1.7M17.4 8.6l1.7-1.7"></path></svg>
-          Settings
-        </a>
-      </nav>
-
-      <div class="sidebar-footer">
-        <div class="health-pill" id="health-pill">
-          <span class="led"></span>
-          <span id="health-text">Connecting&hellip;</span>
+      <div class="pipeline">
+        <div class="pipeline-track" id="pipelineTrack">
+          <div class="pipe-node is-active"><span class="pipe-dot"></span>Gmail</div>
+          <div class="pipe-link"></div>
+          <div class="pipe-node is-active"><span class="pipe-dot"></span>Gemini</div>
+          <div class="pipe-link"></div>
+          <div class="pipe-node is-active"><span class="pipe-dot"></span>Sheets</div>
+          <div class="pipe-link"></div>
+          <div class="pipe-node is-active"><span class="pipe-dot"></span>Drive</div>
+          <div class="pipe-link"></div>
+          <div class="pipe-node is-active"><span class="pipe-dot"></span>Mail</div>
         </div>
       </div>
-    </aside>
 
-    <!-- ============================== MAIN ============================== -->
-    <main class="main">
+      <div class="topbar-right">
+        <span class="clock" id="clock">--:--:--</span>
+        <span class="conn-status is-loading" id="connStatus"><span class="conn-dot"></span><span id="connStatusText">Connecting…</span></span>
+      </div>
+    </div>
+  </header>
 
-      <!-- Persistent top navigation (static chrome; per-view titles render inside #view via .view-title-row) -->
-      <header class="topbar">
-        <div>
-          <h1>BIP Management System</h1>
-          <div class="lede">Erasmus+ Blended Intensive Programmes &mdash; International Relations Office, STU</div>
-        </div>
-        <div class="topbar-actions">
-          <div style="position:relative;">
-            <button class="btn btn-ghost" id="btn-notifications" type="button" style="position:relative;" aria-haspopup="true" aria-expanded="false" aria-controls="notifications-panel" title="Notifications">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9a6 6 0 0 1 12 0c0 3.2 1 5 2 6H4c1-1 2-2.8 2-6Z"></path><path d="M9.5 19a2.5 2.5 0 0 0 5 0"></path></svg>
-              <span id="notifications-badge" style="display:none;position:absolute;top:3px;right:3px;background:var(--bad);color:#fff;font-size:10px;font-weight:700;line-height:1;min-width:15px;height:15px;border-radius:999px;align-items:center;justify-content:center;padding:0 3px;">0</span>
-            </button>
+  <main class="shell">
 
-            <div class="panel" id="notifications-panel" style="display:none;position:absolute;top:calc(100% + 8px);right:0;width:320px;margin-bottom:0;box-shadow:var(--shadow);z-index:50;" role="dialog" aria-label="Notifications">
-              <div class="panel-head">
-                <h2>Notifications</h2>
-                <span class="hint" id="notifications-count-label">0 new</span>
-              </div>
-              <div class="row-list" id="notifications-list">
-                <div class="empty-state" id="notifications-empty">You&rsquo;re all caught up &mdash; no new notifications.</div>
-              </div>
+    <section class="overview" id="overviewGrid">
+      <div class="stat-card">
+        <div class="stat-label">Total BIP records</div>
+        <div class="stat-value skeleton" id="statTotal">0</div>
+        <div class="stat-foot">Rows in the Main sheet</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Pending review</div>
+        <div class="stat-value skeleton" id="statPending">0</div>
+        <div class="stat-foot">No faculty decision yet</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Upcoming deadlines</div>
+        <div class="stat-value skeleton" id="statDeadlines">0</div>
+        <div class="stat-foot">Application deadline not yet passed</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Drive root folder</div>
+        <div class="stat-value skeleton" id="statDrive" style="font-size:16px; margin-top:9px;">—</div>
+        <div class="stat-foot" id="statDriveFoot">Loading…</div>
+      </div>
+    </section>
+
+    <div class="columns">
+      <!-- MAIN COLUMN -->
+      <div class="col">
+
+        <section class="card" id="cardHealth">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">Configuration health</h2>
+              <div class="card-desc">Derived from the settings currently stored in Script Properties</div>
             </div>
           </div>
-        </div>
-      </header>
+          <div class="card-body" id="healthBody">
+            <div class="health-row"><span class="health-label">Loading…</span></div>
+          </div>
+        </section>
 
-      <!-- Router.render() (script.js) swaps Views.dashboard / Views.search / Views.reminders / Views.settings in and out of this node -->
-      <div id="view"></div>
+        <section class="card" id="cardControls">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">Manual controls</h2>
+              <div class="card-desc">Every action calls the live Router — results below are real responses, not simulated</div>
+            </div>
+            <button class="btn btn-ghost btn-sm" id="btnRefreshAll">Refresh status</button>
+          </div>
+          <div class="card-body">
+            <div class="action-grid">
+              <button class="btn btn-primary" id="btnRunImport" data-action="import">Run import now</button>
+              <button class="btn btn-primary" id="btnRunReminder" data-action="sendReminder">Run reminder check</button>
+              <button class="btn btn-ghost" id="btnTestGemini" data-action="testGemini">Test Gemini connection</button>
+            </div>
+            <div class="action-result" id="actionResult"></div>
+          </div>
+        </section>
 
-    </main>
-  </div>
+        <section class="card" id="cardBreakdown">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">Records breakdown</h2>
+              <div class="card-desc">Live counts from SpreadsheetService.getStatistics()</div>
+            </div>
+          </div>
+          <div class="card-body" id="breakdownBody">
+            <div class="field-help">Loading…</div>
+          </div>
+        </section>
 
-  <!-- ============================== DRAWER (BIP detail) ============================== -->
-  <div class="drawer-overlay" id="drawer-overlay"></div>
-  <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
-    <div class="drawer-head">
-      <div>
-        <h3 id="drawer-title">&mdash;</h3>
-        <div class="drawer-sub" id="drawer-sub">&mdash;</div>
+        <section class="card" id="cardLog">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">Activity log</h2>
+              <div class="card-desc">Actions taken from this dashboard in the current session</div>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="log-list" id="logList">
+              <div class="log-empty">No activity yet — actions you run will appear here.</div>
+            </div>
+          </div>
+        </section>
+
       </div>
-      <button class="drawer-close" id="drawer-close" type="button" aria-label="Close panel">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="5" x2="19" y2="19"></line><line x1="19" y1="5" x2="5" y2="19"></line></svg>
-      </button>
+
+      <!-- SIDE COLUMN -->
+      <div class="col">
+
+        <section class="card" id="cardReminderSettings">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">Reminder schedule</h2>
+              <div class="card-desc">Follow-ups sent to coordinators who haven't responded yet</div>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label class="field-label">Remind every</label>
+              <div class="pill-group" id="reminderDaysPills"></div>
+              <div class="field" id="reminderCustomWrap" style="display:none; margin-top:10px;">
+                <input type="number" min="1" step="1" class="input" id="reminderCustomDays" placeholder="Number of days" />
+              </div>
+              <div class="field-help">Days to wait after import (or the last reminder) before notifying coordinators again.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Reminder run time</label>
+              <select class="select" id="reminderHour"></select>
+            </div>
+            <button class="btn btn-accent btn-block" id="btnSaveReminder" disabled>Save reminder settings</button>
+          </div>
+        </section>
+
+        <section class="card" id="cardImportSettings">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">Email import</h2>
+              <div class="card-desc">The daily check that looks for new BIP invitation emails</div>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label class="field-label">Import run time</label>
+              <select class="select" id="importHour"></select>
+            </div>
+            <div class="field">
+              <label class="field-label">Gmail search query</label>
+              <textarea class="textarea is-mono" id="gmailQuery"></textarea>
+              <div class="field-help">Runs once a day and only processes messages not already imported.</div>
+            </div>
+            <button class="btn btn-accent btn-block" id="btnSaveImport" disabled>Save import settings</button>
+          </div>
+        </section>
+
+        <section class="card" id="cardNotifications">
+          <div class="card-head">
+            <div><h2 class="card-title">Notifications</h2></div>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label class="field-label">Admin alert email</label>
+              <input type="email" class="input" id="adminEmail" placeholder="you@stuba.sk" />
+              <div class="field-help">Optional — also receives every new-BIP notification.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Sender display name</label>
+              <input type="text" class="input" id="senderName" />
+            </div>
+            <button class="btn btn-accent btn-block" id="btnSaveNotifications" disabled>Save notification settings</button>
+          </div>
+        </section>
+
+        <section class="card" id="cardAccess">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">Connections &amp; access</h2>
+              <div class="card-desc">Core resources this system reads from and writes to</div>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label class="field-label">Spreadsheet ID</label>
+              <input type="text" class="input is-mono" id="spreadsheetId" />
+            </div>
+            <div class="field">
+              <label class="field-label">Drive root folder ID</label>
+              <input type="text" class="input is-mono" id="driveFolderId" />
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label class="field-label">Gemini model</label>
+                <input type="text" class="input is-mono" id="geminiModel" />
+              </div>
+              <div class="field">
+                <label class="field-label">Timezone</label>
+                <input type="text" class="input is-mono" id="timezone" placeholder="Europe/Bratislava" />
+              </div>
+            </div>
+            <div class="field">
+              <label class="field-label">Gemini API key</label>
+              <input type="text" class="input is-mono" id="geminiKeyCurrent" disabled />
+              <input type="password" class="input is-mono" id="geminiKeyNew" placeholder="Enter a new key to replace it" style="margin-top:8px;" />
+              <div class="field-help">Leave the second field blank to keep the current key.</div>
+            </div>
+            <button class="btn btn-accent btn-block" id="btnSaveAccess" disabled>Save connection settings</button>
+          </div>
+        </section>
+
+      </div>
     </div>
-    <div class="drawer-body" id="drawer-body"></div>
-  </aside>
+  </main>
 
-  <!-- ============================== MODAL CONTAINER (future: confirmations / forms) ============================== -->
-  <div class="modal-overlay" id="modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(22,32,43,.35);align-items:center;justify-content:center;z-index:55;">
-    <div class="modal" id="modal-container" role="dialog" aria-modal="true" aria-labelledby="modal-title" style="background:var(--surface);border-radius:var(--radius);width:min(440px,90vw);max-height:85vh;overflow:auto;box-shadow:var(--shadow);">
-      <div class="panel-head">
-        <h2 id="modal-title">Confirm action</h2>
-        <button class="drawer-close" id="modal-close" type="button" aria-label="Close">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="5" x2="19" y2="19"></line><line x1="19" y1="5" x2="5" y2="19"></line></svg>
-        </button>
-      </div>
-      <div class="panel-body padded" id="modal-body">
-        <p style="margin:0;font-size:13px;color:var(--ink-soft);line-height:1.6;">Are you sure you want to continue? This action cannot be undone.</p>
-      </div>
-      <div class="panel-body padded" id="modal-footer" style="display:flex;justify-content:flex-end;gap:10px;border-top:1px solid var(--border);">
-        <button class="btn btn-ghost" id="modal-cancel" type="button">Cancel</button>
-        <button class="btn btn-primary" id="modal-confirm" type="button"><span class="spinner"></span><span class="btn-label">Confirm</span></button>
-      </div>
-    </div>
-  </div>
+  <footer class="footer">
+    <span><strong id="footApp">BIP Automation</strong></span>
+    <span class="footer-sep">•</span>
+    <span id="footOrg">—</span>
+    <span class="footer-sep">•</span>
+    <span>Deployment: <span id="footUrl" style="font-family:var(--font-mono);">—</span></span>
+    <span class="footer-sep">•</span>
+    <span>Last refreshed: <span id="footRefreshed">—</span></span>
+  </footer>
 
-  <!-- ============================== LOADING OVERLAY (future: initial boot / long operations) ============================== -->
-  <div class="loading-overlay" id="loading-overlay" role="status" aria-live="polite" aria-label="Loading" style="display:none;position:fixed;inset:0;background:var(--bg);align-items:center;justify-content:center;flex-direction:column;gap:14px;z-index:80;">
-    <div class="spinner" id="loading-spinner" style="width:34px;height:34px;border-width:3px;border-color:var(--border);border-top-color:var(--accent);"></div>
-    <div id="loading-text" style="font-size:13px;color:var(--ink-soft);font-weight:500;">Loading BIP Management System&hellip;</div>
-  </div>
+<script>
+(function(){
+  "use strict";
 
-  <!-- ============================== TOASTS ============================== -->
-  <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="true"></div>
+  /* ------------------------------------------------------------------
+   * API layer — talks to the existing Router (Router.gs) through this
+   * page's own deployed Web App URL. No mock data, no invented
+   * endpoints: only the actions Router.gs already exposes are called
+   * (statistics, settings, import, sendReminder, testGemini).
+   * ---------------------------------------------------------------- */
+  var API_BASE = (function(){
+    var url = new URL(window.location.href);
+    return url.origin + url.pathname;
+  })();
 
-  <!-- JavaScript.html — the uploaded script.js contents, included verbatim, not duplicated here. -->
-  <script src="script.js"></script>
+  function apiUrl(action){
+    return API_BASE + "?action=" + encodeURIComponent(action);
+  }
+
+  function callApi(action, opts){
+    opts = opts || {};
+    var method = opts.method || "GET";
+    var fetchOpts = { method: method };
+    if (method === "POST"){
+      // text/plain avoids a CORS preflight against the Apps Script
+      // exec endpoint; Router parses the body as JSON regardless of
+      // the declared content type.
+      fetchOpts.headers = { "Content-Type": "text/plain;charset=utf-8" };
+      fetchOpts.body = JSON.stringify(opts.body || {});
+    }
+    return fetch(apiUrl(action), fetchOpts).then(function(res){
+      return res.json().catch(function(){
+        throw new Error("The server returned an unreadable response (HTTP " + res.status + ").");
+      }).then(function(payload){
+        if (!payload || payload.success !== true){
+          var msg = (payload && payload.error) ? payload.error : ("Request failed (HTTP " + res.status + ").");
+          var err = new Error(msg);
+          err.errorCode = payload && payload.errorCode;
+          throw err;
+        }
+        return payload.data;
+      });
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
+
+  var state = {
+    settings: null,
+    dashboard: null,
+    log: []
+  };
+
+  var HOURS = [];
+  for (var h = 0; h < 24; h++){ HOURS.push(h); }
+
+  var REMINDER_PRESETS = [1, 2, 3, 5, 7, 14];
+
+  var SETTINGS_KEYS = {
+    SPREADSHEET_ID: "SPREADSHEET_ID",
+    DRIVE_ROOT_FOLDER_ID: "DRIVE_ROOT_FOLDER_ID",
+    GEMINI_API_KEY: "GEMINI_API_KEY",
+    GEMINI_MODEL: "GEMINI_MODEL",
+    GMAIL_SEARCH_QUERY: "GMAIL_SEARCH_QUERY",
+    REMINDER_INTERVAL_DAYS: "REMINDER_INTERVAL_DAYS",
+    TIMEZONE: "TIMEZONE",
+    IMPORT_TRIGGER_HOUR: "IMPORT_TRIGGER_HOUR",
+    REMINDER_TRIGGER_HOUR: "REMINDER_TRIGGER_HOUR",
+    ADMIN_ALERT_EMAIL: "ADMIN_ALERT_EMAIL",
+    NOTIFICATION_SENDER_NAME: "NOTIFICATION_SENDER_NAME"
+  };
+
+  function pad2(n){ return (n < 10 ? "0" : "") + n; }
+  function hourLabel(h){ return pad2(h) + ":00"; }
+  function escapeHtml(text){
+    return String(text === undefined || text === null ? "" : text)
+      .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  }
+  function titleCase(key){
+    return String(key).toLowerCase().replace(/(^|_)([a-z])/g, function(_, sep, c){ return (sep ? " " : "") + c.toUpperCase(); });
+  }
+  function firstDefined(obj, keys){
+    if (!obj) return null;
+    for (var i = 0; i < keys.length; i++){
+      if (obj[keys[i]] !== undefined && obj[keys[i]] !== null && obj[keys[i]] !== "") return obj[keys[i]];
+    }
+    return null;
+  }
+
+  /* ---------------------------- Clock ---------------------------- */
+  function tickClock(){
+    var el = document.getElementById("clock");
+    var now = new Date();
+    el.textContent = pad2(now.getHours()) + ":" + pad2(now.getMinutes()) + ":" + pad2(now.getSeconds());
+  }
+  setInterval(tickClock, 1000);
+  tickClock();
+
+  /* ------------------------- Connection badge ------------------------- */
+  function setConnStatus(mode, text){
+    var el = document.getElementById("connStatus");
+    el.classList.remove("is-error", "is-loading");
+    if (mode === "error") el.classList.add("is-error");
+    if (mode === "loading") el.classList.add("is-loading");
+    document.getElementById("connStatusText").textContent = text;
+  }
+
+  /* ----------------------------- Log ----------------------------- */
+  function addLog(level, text){
+    state.log.push({ level: level, text: text, time: new Date() });
+    if (state.log.length > 30) state.log.shift();
+    renderLog();
+  }
+  function renderLog(){
+    var list = document.getElementById("logList");
+    if (state.log.length === 0){
+      list.innerHTML = '<div class="log-empty">No activity yet — actions you run will appear here.</div>';
+      return;
+    }
+    var html = "";
+    state.log.forEach(function(entry){
+      var t = entry.time;
+      var timeStr = pad2(t.getHours()) + ":" + pad2(t.getMinutes()) + ":" + pad2(t.getSeconds());
+      html += '<div class="log-row ' + entry.level + '">' +
+                '<span class="log-dot"></span>' +
+                '<div><div class="log-text">' + escapeHtml(entry.text) + '</div>' +
+                '<div class="log-time">' + timeStr + '</div></div>' +
+              '</div>';
+    });
+    list.innerHTML = html;
+  }
+
+  /* ------------------------- Overview + health ------------------------- */
+  function renderOverview(dashboard){
+    var stats = dashboard.statistics || {};
+    document.getElementById("statTotal").textContent = stats.totalRecords != null ? stats.totalRecords : "0";
+    document.getElementById("statTotal").classList.remove("skeleton");
+
+    var pending = (stats.byDecisionStatus && stats.byDecisionStatus.pending) || 0;
+    document.getElementById("statPending").textContent = pending;
+    document.getElementById("statPending").classList.remove("skeleton");
+
+    document.getElementById("statDeadlines").textContent = stats.upcomingDeadlines != null ? stats.upcomingDeadlines : "0";
+    document.getElementById("statDeadlines").classList.remove("skeleton");
+
+    var drive = dashboard.driveRootFolder || {};
+    var driveName = firstDefined(drive, ["name", "folderName", "title"]);
+    var driveUrl = firstDefined(drive, ["url", "folderUrl", "webViewLink", "link"]);
+    var driveEl = document.getElementById("statDrive");
+    var driveFootEl = document.getElementById("statDriveFoot");
+    driveEl.classList.remove("skeleton");
+    if (driveUrl){
+      driveEl.innerHTML = '<a href="' + escapeHtml(driveUrl) + '" target="_blank" rel="noopener">' + escapeHtml(driveName || "Open folder") + '</a>';
+      driveFootEl.textContent = "Opens in Google Drive";
+    } else if (driveName){
+      driveEl.textContent = driveName;
+      driveFootEl.textContent = "No link reported by DriveService";
+    } else {
+      driveEl.textContent = "Unavailable";
+      driveFootEl.textContent = "DriveService returned no folder info";
+    }
+  }
+
+  function renderBreakdown(dashboard){
+    var stats = dashboard.statistics || {};
+    var body = document.getElementById("breakdownBody");
+    var html = "";
+
+    html += renderBarGroup("By decision status", stats.byDecisionStatus || {});
+    html += renderBarGroup("By academic level", stats.byAcademicLevel || {});
+
+    body.innerHTML = html || '<div class="field-help">No records yet.</div>';
+  }
+
+  function renderBarGroup(title, dataObj){
+    var entries = Object.keys(dataObj).map(function(k){ return [k, dataObj[k]]; });
+    if (entries.length === 0) return "";
+    var max = Math.max.apply(null, entries.map(function(e){ return e[1]; }).concat([1]));
+    var rows = entries.map(function(e){
+      var pct = Math.round((e[1] / max) * 100);
+      return '<div class="bar-row">' +
+               '<span class="bar-name">' + escapeHtml(titleCase(e[0])) + '</span>' +
+               '<span class="bar-track"><span class="bar-fill" style="width:' + pct + '%"></span></span>' +
+               '<span class="bar-count">' + e[1] + '</span>' +
+             '</div>';
+    }).join("");
+    return '<div class="bar-group"><div class="bar-group-title">' + escapeHtml(title) + '</div>' + rows + '</div>';
+  }
+
+  function renderHealth(settings){
+    var body = document.getElementById("healthBody");
+    var critical = [
+      { key: SETTINGS_KEYS.SPREADSHEET_ID, label: "Spreadsheet connection" },
+      { key: SETTINGS_KEYS.DRIVE_ROOT_FOLDER_ID, label: "Drive root folder" },
+      { key: SETTINGS_KEYS.GEMINI_API_KEY, label: "Gemini API key" }
+    ];
+    var html = "";
+    critical.forEach(function(item){
+      var value = settings[item.key];
+      var isSet = value !== undefined && value !== null && String(value).trim() !== "";
+      html += '<div class="health-row">' +
+                '<span class="health-label">' + escapeHtml(item.label) + '</span>' +
+                (isSet
+                  ? '<span class="badge badge-ok">Configured</span>'
+                  : '<span class="badge badge-error">Missing</span>') +
+              '</div>';
+    });
+    var adminSet = settings[SETTINGS_KEYS.ADMIN_ALERT_EMAIL] && String(settings[SETTINGS_KEYS.ADMIN_ALERT_EMAIL]).trim() !== "";
+    html += '<div class="health-row">' +
+              '<span class="health-label">Admin alert email</span>' +
+              (adminSet ? '<span class="badge badge-ok">Set</span>' : '<span class="badge badge-neutral">Not set</span>') +
+            '</div>';
+    body.innerHTML = html;
+  }
+
+  /* ---------------------------- Settings form ---------------------------- */
+  function populateHourSelect(selectEl, currentValue){
+    selectEl.innerHTML = HOURS.map(function(h){
+      return '<option value="' + h + '">' + hourLabel(h) + '</option>';
+    }).join("");
+    selectEl.value = String(currentValue);
+  }
+
+  function renderReminderPills(currentDays){
+    var wrap = document.getElementById("reminderDaysPills");
+    var isPreset = REMINDER_PRESETS.indexOf(Number(currentDays)) !== -1;
+    var html = REMINDER_PRESETS.map(function(d){
+      var checked = (!isPreset ? false : Number(currentDays) === d) ? " checked" : "";
+      return '<label class="pill-radio"><input type="radio" name="reminderPreset" value="' + d + '"' + checked + '><span>' + d + (d === 1 ? " day" : " days") + '</span></label>';
+    }).join("");
+    var customChecked = isPreset ? "" : " checked";
+    html += '<label class="pill-radio"><input type="radio" name="reminderPreset" value="custom"' + customChecked + '><span>Custom</span></label>';
+    wrap.innerHTML = html;
+
+    var customWrap = document.getElementById("reminderCustomWrap");
+    var customInput = document.getElementById("reminderCustomDays");
+    customWrap.style.display = isPreset ? "none" : "block";
+    customInput.value = currentDays;
+
+    Array.prototype.forEach.call(wrap.querySelectorAll('input[name="reminderPreset"]'), function(radio){
+      radio.addEventListener("change", function(){
+        customWrap.style.display = (radio.value === "custom") ? "block" : "none";
+        markDirty("cardReminderSettings");
+      });
+    });
+  }
+
+  function getReminderDaysValue(){
+    var checked = document.querySelector('input[name="reminderPreset"]:checked');
+    if (!checked) return null;
+    if (checked.value === "custom"){
+      var n = parseInt(document.getElementById("reminderCustomDays").value, 10);
+      return (isFinite(n) && n > 0) ? n : null;
+    }
+    return parseInt(checked.value, 10);
+  }
+
+  function fillForm(settings){
+    populateHourSelect(document.getElementById("reminderHour"), settings[SETTINGS_KEYS.REMINDER_TRIGGER_HOUR]);
+    renderReminderPills(settings[SETTINGS_KEYS.REMINDER_INTERVAL_DAYS]);
+
+    populateHourSelect(document.getElementById("importHour"), settings[SETTINGS_KEYS.IMPORT_TRIGGER_HOUR]);
+    document.getElementById("gmailQuery").value = settings[SETTINGS_KEYS.GMAIL_SEARCH_QUERY] || "";
+
+    document.getElementById("adminEmail").value = settings[SETTINGS_KEYS.ADMIN_ALERT_EMAIL] || "";
+    document.getElementById("senderName").value = settings[SETTINGS_KEYS.NOTIFICATION_SENDER_NAME] || "";
+
+    document.getElementById("spreadsheetId").value = settings[SETTINGS_KEYS.SPREADSHEET_ID] || "";
+    document.getElementById("driveFolderId").value = settings[SETTINGS_KEYS.DRIVE_ROOT_FOLDER_ID] || "";
+    document.getElementById("geminiModel").value = settings[SETTINGS_KEYS.GEMINI_MODEL] || "";
+    document.getElementById("timezone").value = settings[SETTINGS_KEYS.TIMEZONE] || "";
+    document.getElementById("geminiKeyCurrent").value = settings[SETTINGS_KEYS.GEMINI_API_KEY] || "(not set)";
+    document.getElementById("geminiKeyNew").value = "";
+
+    ["cardReminderSettings","cardImportSettings","cardNotifications","cardAccess"].forEach(function(id){
+      var saveBtn = document.querySelector("#" + id + " button[id^='btnSave']");
+      if (saveBtn) saveBtn.disabled = true;
+    });
+  }
+
+  function markDirty(cardId){
+    var saveBtn = document.querySelector("#" + cardId + " button[id^='btnSave']");
+    if (saveBtn) saveBtn.disabled = false;
+  }
+
+  ["cardReminderSettings","cardImportSettings","cardNotifications","cardAccess"].forEach(function(id){
+    var card = document.getElementById(id);
+    card.addEventListener("input", function(){ markDirty(id); });
+    card.addEventListener("change", function(){ markDirty(id); });
+  });
+
+  function saveSettings(payload, button){
+    setButtonBusy(button, true);
+    return callApi("settings", { method: "POST", body: payload }).then(function(updated){
+      state.settings = updated;
+      fillForm(updated);
+      renderHealth(updated);
+      addLog("ok", "Settings saved: " + Object.keys(payload).join(", "));
+      setButtonBusy(button, false);
+    }).catch(function(err){
+      addLog("err", "Failed to save settings — " + err.message);
+      setButtonBusy(button, false);
+      alert("Could not save settings: " + err.message);
+    });
+  }
+
+  document.getElementById("btnSaveReminder").addEventListener("click", function(){
+    var days = getReminderDaysValue();
+    if (!days){ alert("Enter a valid number of days (1 or more)."); return; }
+    saveSettings({
+      REMINDER_INTERVAL_DAYS: days,
+      REMINDER_TRIGGER_HOUR: parseInt(document.getElementById("reminderHour").value, 10)
+    }, this);
+  });
+
+  document.getElementById("btnSaveImport").addEventListener("click", function(){
+    saveSettings({
+      IMPORT_TRIGGER_HOUR: parseInt(document.getElementById("importHour").value, 10),
+      GMAIL_SEARCH_QUERY: document.getElementById("gmailQuery").value.trim()
+    }, this);
+  });
+
+  document.getElementById("btnSaveNotifications").addEventListener("click", function(){
+    saveSettings({
+      ADMIN_ALERT_EMAIL: document.getElementById("adminEmail").value.trim(),
+      NOTIFICATION_SENDER_NAME: document.getElementById("senderName").value.trim()
+    }, this);
+  });
+
+  document.getElementById("btnSaveAccess").addEventListener("click", function(){
+    var payload = {
+      SPREADSHEET_ID: document.getElementById("spreadsheetId").value.trim(),
+      DRIVE_ROOT_FOLDER_ID: document.getElementById("driveFolderId").value.trim(),
+      GEMINI_MODEL: document.getElementById("geminiModel").value.trim(),
+      TIMEZONE: document.getElementById("timezone").value.trim()
+    };
+    var newKey = document.getElementById("geminiKeyNew").value.trim();
+    if (newKey) payload.GEMINI_API_KEY = newKey;
+    saveSettings(payload, this);
+  });
+
+  /* ---------------------------- Manual actions ---------------------------- */
+  function setButtonBusy(button, busy){
+    if (!button) return;
+    if (busy){
+      button.dataset.label = button.dataset.label || button.textContent;
+      button.disabled = true;
+      button.innerHTML = '<span class="spinner"></span> Working…';
+    } else {
+      button.disabled = false;
+      button.textContent = button.dataset.label || button.textContent;
+    }
+  }
+
+  function showActionResult(ok, text){
+    var el = document.getElementById("actionResult");
+    el.className = "action-result show " + (ok ? "ok" : "err");
+    el.textContent = text;
+  }
+
+  function summarizeImport(data){
+    return "Import finished — " + data.candidatesFound + " found, " + data.imported + " imported, " +
+      data.duplicates + " duplicate(s), " + data.failed + " failed.";
+  }
+  function summarizeReminder(data){
+    return "Reminder check finished — " + data.totalCandidates + " due, " + data.recordsNotified +
+      " notified (" + data.emailsSent + " email(s) sent), " + (data.failures ? data.failures.length : 0) + " failure(s).";
+  }
+  function summarizeGemini(data){
+    if (data && data.success){
+      return "Gemini connection OK — model " + data.model + ", " + data.latencyMs + "ms.";
+    }
+    return "Gemini connection test returned an unexpected result.";
+  }
+
+  function runAction(action, button){
+    setButtonBusy(button, true);
+    return callApi(action, { method: "POST", body: {} }).then(function(data){
+      var text;
+      if (action === "import") text = summarizeImport(data);
+      else if (action === "sendReminder") text = summarizeReminder(data);
+      else if (action === "testGemini") text = summarizeGemini(data);
+      else text = "Action completed.";
+      showActionResult(true, text);
+      addLog("ok", text);
+      setButtonBusy(button, false);
+      return refreshDashboard();
+    }).catch(function(err){
+      var text = (action === "import" ? "Import" : action === "sendReminder" ? "Reminder check" : "Gemini test") +
+        " failed — " + err.message;
+      showActionResult(false, text);
+      addLog("err", text);
+      setButtonBusy(button, false);
+    });
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll("[data-action]"), function(btn){
+    btn.addEventListener("click", function(){ runAction(btn.getAttribute("data-action"), btn); });
+  });
+
+  document.getElementById("btnRefreshAll").addEventListener("click", function(){
+    refreshAll();
+  });
+
+  /* ---------------------------- Bootstrapping ---------------------------- */
+  function refreshDashboard(){
+    return callApi("statistics").then(function(data){
+      state.dashboard = data;
+      renderOverview(data);
+      renderBreakdown(data);
+    });
+  }
+
+  function refreshSettings(){
+    return callApi("settings").then(function(data){
+      state.settings = data;
+      renderHealth(data);
+      fillForm(data);
+    });
+  }
+
+  function markFooter(){
+    document.getElementById("footUrl").textContent = API_BASE;
+    document.getElementById("footRefreshed").textContent =
+      pad2(new Date().getHours()) + ":" + pad2(new Date().getMinutes()) + ":" + pad2(new Date().getSeconds());
+  }
+
+  function refreshAll(){
+    setConnStatus("loading", "Connecting…");
+    return Promise.all([refreshDashboard(), refreshSettings()]).then(function(){
+      setConnStatus("ok", "Connected");
+      markFooter();
+      if (state.dashboard && state.dashboard.app){
+        document.getElementById("appTitle").textContent = state.dashboard.app.NAME || "BIP Automation";
+        document.getElementById("appVersion").textContent = "v" + (state.dashboard.app.VERSION || "—");
+        document.getElementById("footApp").textContent =
+          (state.dashboard.app.NAME || "BIP Automation") + " v" + (state.dashboard.app.VERSION || "—");
+        document.getElementById("footOrg").textContent = state.dashboard.app.ORGANIZATION || "";
+      }
+    }).catch(function(err){
+      setConnStatus("error", "Connection error");
+      addLog("err", "Could not load dashboard data — " + err.message);
+      markFooter();
+    });
+  }
+
+  document.addEventListener("DOMContentLoaded", function(){
+    refreshAll();
+  });
+
+})();
+</script>
 </body>
 </html>
