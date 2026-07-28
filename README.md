@@ -1,3 +1,20 @@
+<p align="center">
+
+![Google Apps Script](https://img.shields.io/badge/Google%20Apps%20Script-V8-4285F4?logo=googleappsscript&logoColor=white)
+![Gemini](https://img.shields.io/badge/Gemini-AI-8E75FF?logo=googlegemini&logoColor=white)
+![Google Sheets](https://img.shields.io/badge/Google-Sheets-34A853?logo=googlesheets&logoColor=white)
+![Google Drive](https://img.shields.io/badge/Google-Drive-0F9D58?logo=googledrive&logoColor=white)
+![Gmail](https://img.shields.io/badge/Google-Gmail-EA4335?logo=gmail&logoColor=white)
+
+![HTML5](https://img.shields.io/badge/HTML5-E34F26?logo=html5&logoColor=white)
+![CSS3](https://img.shields.io/badge/CSS3-1572B6?logo=css3&logoColor=white)
+![JavaScript](https://img.shields.io/badge/JavaScript-ES6-F7DF1E?logo=javascript&logoColor=black)
+
+![Status](https://img.shields.io/badge/Status-Production-success)
+![License](https://img.shields.io/badge/License-MIT-blue)
+
+</p>
+
 # BIP Automation
 
 A production-ready Google Apps Script application that automates the processing of Erasmus+ Blended Intensive Programme (BIP) invitation emails.
@@ -245,11 +262,3 @@ The project includes:
 Developed for the International Office of the Slovak University of Technology (STU).
 
 Built to automate the Erasmus+ Blended Intensive Programme invitation workflow.
-
-# BIP Automation
-
-![Google Apps Script](https://img.shields.io/badge/Google%20Apps%20Script-V8-blue)
-![Google Sheets](https://img.shields.io/badge/Google-Sheets-green)
-![Gemini AI](https://img.shields.io/badge/Google-Gemini-orange)
-![Status](https://img.shields.io/badge/status-production-success)
-![License](https://img.shields.io/badge/license-MIT-blue)
